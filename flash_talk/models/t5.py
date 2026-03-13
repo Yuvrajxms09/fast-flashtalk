@@ -4,6 +4,7 @@ import logging
 import math
 import json
 import os
+from typing import Dict
 
 import torch
 import torch.nn as nn
@@ -535,6 +536,7 @@ class T5EncoderModel:
         shard_fn=None,
         quant=None,
         quant_dir=None,
+        cache_contexts=[],
     ):
         assert quant is None or quant in ("int8", "fp8")
         self.text_len = text_len
@@ -542,7 +544,7 @@ class T5EncoderModel:
         self.device = device
         self.checkpoint_path = checkpoint_path
         self.tokenizer_path = tokenizer_path
-
+        self.cache_contexts = cache_contexts
         # init model
         logging.info(f"loading {checkpoint_path}")
         if quant is not None:
@@ -584,6 +586,11 @@ class T5EncoderModel:
         self.tokenizer = HuggingfaceTokenizer(
             name=tokenizer_path, seq_len=text_len, clean="whitespace"
         )
+        self.cache_contexts: Dict[str, torch.Tensor] = {}
+        for context in cache_contexts:
+            self.model.to("cuda")
+            self.cache_contexts[context] = self.predict(context).to("cpu")
+            self.model.to("cpu")
 
     def __call__(self, texts, device):
         ids, mask = self.tokenizer(texts, return_mask=True, add_special_tokens=True)

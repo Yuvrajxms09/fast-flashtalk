@@ -280,11 +280,12 @@ class AttentionBlock(nn.Module):
         )
 
         # apply attention
-        x = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-        )
+        # print(q.shape, k.shape, v.shape)
+        # q = q.permute(0, 2, 1, 3)
+        # k = k.permute(0, 2, 1, 3)
+        # v = v.permute(0, 2, 1, 3)
+        # x = flash_attn_func(q, k, v)
+        x = F.scaled_dot_product_attention(q, k, v)
         x = x.squeeze(1).permute(0, 2, 1).reshape(b * t, c, h, w)
 
         # output

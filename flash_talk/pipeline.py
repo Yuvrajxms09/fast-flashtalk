@@ -2,22 +2,32 @@
 import math
 import os
 import time
+import yaml
+from typing import Literal
+from collections import deque
+from datetime import datetime
 
 import numpy as np
 import torch
-import torch.distributed as dist
+import torch.nn as nn
 from einops import rearrange
 from gemlite.core import GemLiteLinear
 from transformers import Wav2Vec2FeatureExtractor
 from loguru import logger
-from PIL import Image
-import torch.nn as nn
+
+# from PIL import Image
+# import librosa
+from osc_data.video import Video
+from osc_data.image import Image
+from osc_data.audio import Audio
 
 from flash_talk.models import WanVAE, CLIPModel, T5EncoderModel, Wav2Vec2Model
 from flash_talk.models.dit import WanModel, WanLayerNorm, WanRMSNorm
 from flash_talk.utils import (
     match_and_blend_colors_torch,
     resize_and_centercrop,
+    loudness_norm,
+    save_video_ffmpeg,
 )
 from .quantize import quantize_model_a8w8_int8_gemlite
 from .vram_management import (
@@ -25,6 +35,7 @@ from .vram_management import (
     AutoWrappedLinear,
     AutoWrappedModule,
 )
+from .configs import multitalk_14B
 
 # compile models to speedup inference
 COMPILE_MODEL = True
@@ -62,16 +73,16 @@ def timestep_transform(
 class FlashTalkPipeline:
     def __init__(
         self,
-        config,
         checkpoint_dir,
         wav2vec_dir,
         device="cuda",
         use_usp=False,
-        cpu_offload=False,
+        cpu_offload=True,
         num_timesteps=1000,
         use_timestep_transform=True,
         num_persistent_param_in_dit=15_000_000_000,
         quantize: bool = True,
+        **kwargs,
     ):
         r"""
         Initializes the image-to-video generation model components.
@@ -97,9 +108,12 @@ class FlashTalkPipeline:
                 Enable quantization.
         """
         self.device = device
+        config = multitalk_14B
         self.config = config
-        self.rank = dist.get_rank() if dist.is_initialized() else 0
-        self.use_usp = use_usp and dist.is_initialized()
+        with open("flash_talk/configs/infer_params.yaml", "r") as f:
+            self.infer_params = yaml.safe_load(f)
+        self.rank = 0
+        self.use_usp = False
         self.param_dtype = config.param_dtype
         self.cpu_offload = cpu_offload and not self.use_usp
 
@@ -252,15 +266,15 @@ class FlashTalkPipeline:
     @torch.no_grad()
     def prepare_params(
         self,
-        input_prompt,
-        cond_image,
-        target_size,
-        frame_num,
-        motion_frames_num,
-        sampling_steps,
-        seed=None,
-        shift=5.0,
-        color_correction_strength=0.0,
+        input_prompt: str,
+        cond_image: Image,
+        target_size: tuple[int, int] = (768, 448),
+        frame_num: int = 33,
+        motion_frames_num: int = 5,
+        sampling_steps: int = 4,
+        seed: int = 9999,
+        shift: int = 5,
+        color_correction_strength: float = 1.0,
     ):
 
         if self.cpu_offload:
@@ -272,20 +286,16 @@ class FlashTalkPipeline:
 
         self.frame_num = frame_num
         self.motion_frames_num = motion_frames_num
-
         self.target_h, self.target_w = target_size
-        self.lat_h, self.lat_w = (
-            self.target_h // self.vae_stride[1],
-            self.target_w // self.vae_stride[2],
-        )
-
-        if isinstance(cond_image, str):
-            cond_image = Image.open(cond_image).convert("RGB")
+        cond_image_tensor = torch.from_numpy(cond_image.load().to_rgb().data).permute(
+            2, 0, 1
+        )  # C, H, W
+        # if isinstance(cond_image, str):
+        #     cond_image = Image.open(cond_image).convert("RGB")
         cond_image_tensor = resize_and_centercrop(
-            cond_image, (self.target_h, self.target_w)
+            cond_image_tensor, (self.target_h, self.target_w)
         ).to(dtype=self.param_dtype, device=self.device)
         cond_image_tensor = (cond_image_tensor / 255 - 0.5) * 2
-
         self.cond_image_tensor = cond_image_tensor
 
         self.color_correction_strength = color_correction_strength
@@ -301,7 +311,6 @@ class FlashTalkPipeline:
         if self.cpu_offload:
             self.clip.model.cpu()
             torch.cuda.empty_cache()
-
         video_frames = torch.zeros(
             1,
             cond_image_tensor.shape[1],
@@ -309,11 +318,9 @@ class FlashTalkPipeline:
             self.target_h,
             self.target_w,
         ).to(dtype=self.param_dtype, device=self.device)
-
         padding_frames_pixels_values = torch.concat(
             [cond_image_tensor, video_frames], dim=2
         )
-
         if self.cpu_offload:
             self.vae.model.to(self.device)
             self.vae.scale[0] = self.vae.scale[0].to(self.device)
@@ -322,6 +329,10 @@ class FlashTalkPipeline:
         common_y = y.unsqueeze(0).to(self.param_dtype)
 
         # get mask
+        self.lat_h, self.lat_w = (
+            self.target_h // self.vae_stride[1],
+            self.target_w // self.vae_stride[2],
+        )
         msk = torch.ones(1, frame_num, self.lat_h, self.lat_w, device=self.device)
         msk[:, 1:] = 0
         msk = torch.concat(
@@ -378,7 +389,7 @@ class FlashTalkPipeline:
         return
 
     @torch.no_grad()
-    def preprocess_audio(self, speech_array, sr=16000, fps=25):
+    def preprocess_audio(self, speech_array, sr: int = 16000, fps: int = 25):
         video_length = len(speech_array) * fps / sr
 
         # wav2vec_feature_extractor
@@ -407,8 +418,37 @@ class FlashTalkPipeline:
         audio_emb = rearrange(audio_emb, "b s d -> s b d")
         return audio_emb
 
+    def get_audio_embedding(self, audio_array, audio_start_idx=-1, audio_end_idx=-1):
+        audio_array = loudness_norm(audio_array, self.infer_params["sample_rate"])
+        audio_embedding = self.preprocess_audio(
+            audio_array,
+            sr=self.infer_params["sample_rate"],
+            fps=self.infer_params["tgt_fps"],
+        )
+
+        if audio_start_idx == -1 or audio_end_idx == -1:
+            audio_start_idx = 0
+            audio_end_idx = audio_embedding.shape[0]
+
+        indices = (torch.arange(2 * 2 + 1) - 2) * 1
+
+        center_indices = torch.arange(audio_start_idx, audio_end_idx, 1).unsqueeze(
+            1
+        ) + indices.unsqueeze(0)
+        center_indices = torch.clamp(center_indices, min=0, max=audio_end_idx - 1)
+
+        audio_embedding = audio_embedding[center_indices][None, ...].contiguous()
+        return audio_embedding
+
     @torch.no_grad()
-    def generate(self, audio_embedding):
+    def generate_chunk(self, audio_embedding):
+        """
+        Generate a chunk of video from the audio embedding.
+        Args:
+            audio_embedding: The audio embedding.
+        Returns:
+            The generated video
+        """
         # evaluation mode
         with torch.no_grad():
             self.arg_c.update(
@@ -445,10 +485,6 @@ class FlashTalkPipeline:
                 torch.cuda.synchronize()
                 end_time = time.perf_counter()
                 logger.info(f"model denoise per step: {end_time - start_time:.2f}s")
-
-                # offload dit model
-                if self.vram_management:
-                    self.offload_dit_model()
 
                 noise_pred = -noise_pred_cond
 
@@ -508,5 +544,213 @@ class FlashTalkPipeline:
             torch.cuda.empty_cache()
 
         gen_video_samples = videos  # [:, :, self.motion_frames_num:]
+        gen_video_samples = gen_video_samples[0].to(torch.float32)
+        gen_video_samples = (
+            ((gen_video_samples + 1) / 2).permute(1, 2, 3, 0).clip(0, 1) * 255
+        ).contiguous()
+        return gen_video_samples
+
+    def generate(
+        self,
+        input_prompt: str,
+        audio: Audio,
+        image: Image,
+        audio_encode_mode: Literal["stream", "once"] = "once",
+        video_save_path: str | None = None,
+        merge_video_audio: bool = True,
+        force_9_16: bool = False,
+        **kwargs,
+    ) -> Video:
+        """
+        Generate video from the audio and image prompt.
+
+        This method processes audio input along with a conditioning image to generate
+        a talking head video. The audio is processed in chunks and each chunk generates
+        corresponding video frames.
+
+        Args:
+            input_prompt: The input text prompt describing the desired video generation.
+            image_path: Path to the conditioning image file used as visual reference.
+            audio_path: Path to the audio file (wav format) that drives the lip movements.
+            audio_encode_mode: Strategy for encoding audio, either "stream" or "once".
+                - "stream": Process audio in streaming chunks (default), memory efficient.
+                - "once": Encode entire audio at once then split into chunks.
+
+        Returns:
+            List[torch.Tensor]: A list of video frame tensors, where each tensor has:
+                - Shape: (num_frames, height, width, 3)
+                - Dtype: torch.float32
+                - Value range: [0, 255]
+                - Device: CPU
+                - Channel order: RGB (channels last)
+
+                For example, with 768x448 resolution, each tensor shape is:
+                - First chunk: (33, 768, 448, 3)
+                - Subsequent chunks: (28, 768, 448, 3) or (23, 768, 448, 3) for last chunk
+        """
+        generate_start_time = time.perf_counter()
+        logger.info("Start to generate video...")
+        # prepare data
+        sample_rate = self.infer_params["sample_rate"]
+        tgt_fps = self.infer_params["tgt_fps"]
+        cached_audio_duration = self.infer_params["cached_audio_duration"]
+        frame_num = self.infer_params["frame_num"]
+        motion_frames_num = self.infer_params["motion_frames_num"]
+        slice_len = frame_num - motion_frames_num
+        self.prepare_params(input_prompt=input_prompt, cond_image=image)
+
+        # human_speech_array_all, _ = librosa.load(
+        #     audio_path, sr=self.infer_params["sample_rate"], mono=True
+        # )
+        human_speech_array_all = audio.load(
+            sample_rate=self.infer_params["sample_rate"], mono=True
+        ).data
+        human_speech_array_slice_len = slice_len * sample_rate // tgt_fps
+        human_speech_array_frame_num = frame_num * sample_rate // tgt_fps
+        data_prepare_time = time.perf_counter()
+        logger.info(
+            f"Data preparation time: {data_prepare_time - generate_start_time:.2f}s"
+        )
+
+        generated_list = []
+        if audio_encode_mode == "once":
+            # pad audio with silence to avoid truncating the last chunk
+            remainder = (
+                len(human_speech_array_all) - human_speech_array_frame_num
+            ) % human_speech_array_slice_len
+            if remainder > 0:
+                pad_length = human_speech_array_slice_len - remainder
+                human_speech_array_all = np.concatenate(
+                    [
+                        human_speech_array_all,
+                        np.zeros(pad_length, dtype=human_speech_array_all.dtype),
+                    ]
+                )
+
+            # encode audio together
+            audio_embedding_all = self.get_audio_embedding(human_speech_array_all)
+
+            # split audio embedding into chunks: 33, 28, 28, 28, ...
+            audio_embedding_len = audio_embedding_all.shape[1]
+            chunk_count = (audio_embedding_len - frame_num + slice_len) // slice_len
+            audio_embedding_chunks_list = [
+                audio_embedding_all[
+                    :, i * slice_len : i * slice_len + frame_num
+                ].contiguous()
+                for i in range(chunk_count)
+            ]
+
+            for chunk_idx, audio_embedding_chunk in enumerate(
+                audio_embedding_chunks_list
+            ):
+                torch.cuda.synchronize()
+                start_time = time.time()
+
+                # inference
+                video = self.generate_chunk(audio_embedding_chunk)
+
+                if chunk_idx != 0:
+                    video = video[motion_frames_num:]
+
+                torch.cuda.synchronize()
+                end_time = time.time()
+                logger.info(
+                    f"Generate video chunk-{chunk_idx} done, cost time: {(end_time - start_time):.2f}s"
+                )
+
+                generated_list.append(video.cpu())
+                torch.cuda.empty_cache()
+
+        elif audio_encode_mode == "stream":
+            cached_audio_length_sum = sample_rate * cached_audio_duration
+            audio_end_idx = cached_audio_duration * tgt_fps
+            audio_start_idx = audio_end_idx - frame_num
+
+            audio_dq = deque(
+                [0.0] * cached_audio_length_sum, maxlen=cached_audio_length_sum
+            )
+
+            # pad audio with silence to avoid truncating the last chunk
+            remainder = len(human_speech_array_all) % human_speech_array_slice_len
+            if remainder > 0:
+                pad_length = human_speech_array_slice_len - remainder
+                human_speech_array_all = np.concatenate(
+                    [
+                        human_speech_array_all,
+                        np.zeros(pad_length, dtype=human_speech_array_all.dtype),
+                    ]
+                )
+
+            # split audio embedding into chunks: 28, 28, 28, 28, ...
+            human_speech_array_slices = human_speech_array_all.reshape(
+                -1, human_speech_array_slice_len
+            )
+
+            for chunk_idx, human_speech_array in enumerate(human_speech_array_slices):
+                # streaming encode audio chunks
+                audio_dq.extend(human_speech_array.tolist())
+                audio_array = np.array(audio_dq)
+                audio_embedding = self.get_audio_embedding(
+                    audio_array, audio_start_idx, audio_end_idx
+                )
+
+                torch.cuda.synchronize()
+                start_time = time.time()
+
+                # inference
+                video = self.generate_chunk(audio_embedding)
+                video = video[motion_frames_num:]
+
+                torch.cuda.synchronize()
+                end_time = time.time()
+                logger.info(
+                    f"Generate video chunk-{chunk_idx} done, cost time: {(end_time - start_time):.2f}s"
+                )
+
+                generated_list.append(video.cpu())
+                torch.cuda.empty_cache()
+
+        # if video_save_path is None:
+        #     output_dir = "sample_results"
+        #     if not os.path.exists(output_dir):
+        #         os.makedirs(output_dir)
+        #     timestamp = datetime.now().strftime("%Y%m%d-%H:%M:%S-%f")[:-3]
+        #     filename = f"res_{timestamp}.mp4"
+        #     filepath = os.path.join(output_dir, filename)
+        #     video_save_path = filepath
+        # save_video(generated_list, save_file, audio_path, fps=tgt_fps)
+        # logger.info(f"Saving generated video to {save_file}.mp4")
+        # offload dit model
+        if self.vram_management:
+            self.offload_dit_model()
+        video_array = torch.cat(generated_list, dim=0).numpy().astype(np.uint8)
+        video = Video(data=video_array, prompt=input_prompt, fps=tgt_fps)
+        # if merge_video_audio:
+        #     video = video.merge_audio(audio=audio)
+        # if force_9_16:
+        #     height, width = video.get_best_size(ratio=(9, 16))
+        #     logger.info(f"Resize video to {height}x{width}")
+        #     video = video.resize(height=height, width=width)
+        if video_save_path is None:
+            output_dir = "sample_results"
+            if not os.path.exists(output_dir):
+                os.makedirs(output_dir)
+            timestamp = datetime.now().strftime("%Y%m%d-%H:%M:%S-%f")[:-3]
+            filename = f"res_{timestamp}.mp4"
+            filepath = os.path.join(output_dir, filename)
+            video_save_path = filepath
+        # video.save(video_save_path)
+        save_video_ffmpeg(
+            save_path=video_save_path,
+            gen_video_samples=video.data,
+            audio_samples=audio.data,
+            fps=tgt_fps,
+            audio_sample_rate=audio.sample_rate,
+            force_9_16=force_9_16,
+            merge_video_audio=merge_video_audio,
+        )
         generate_end_time = time.perf_counter()
-        return gen_video_samples[0].to(torch.float32)
+        logger.info(
+            f"FlashTalk Pipeline Generate time: {generate_end_time - generate_start_time:.2f}s"
+        )
+        return video

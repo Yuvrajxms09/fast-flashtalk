@@ -7,93 +7,12 @@ import torch.nn.functional as F
 from einops import rearrange
 from diffusers import ModelMixin
 from diffusers.configuration_utils import ConfigMixin, register_to_config
-from flash_attn.layers.rotary import apply_rotary_emb as flash_apply_rotary_emb
 
+from flash_talk.layers.rope import VideoRopePosition3DEmb
 from flash_talk.layers.attention import SingleStreamMutiAttention
+from flash_talk.kernels.rope import fast_rope_apply, sinusoidal_embedding_1d
+from flash_talk.kernels.attn import attention
 from flash_talk.utils import get_attn_map_with_target
-from flash_talk.kernels.attention import flash_attention
-
-__all__ = ["WanModel"]
-
-
-def sinusoidal_embedding_1d(dim, position):
-    # preprocess
-    assert dim % 2 == 0
-    half = dim // 2
-    position = position.type(torch.float64)
-
-    # calculation
-    sinusoid = torch.outer(
-        position, torch.pow(10000, -torch.arange(half).to(position).div(half))
-    )
-    x = torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
-    return x
-
-
-@amp.autocast("cuda", enabled=False)
-def rope_params(max_seq_len, dim, theta=10000):
-
-    assert dim % 2 == 0
-    freqs = torch.outer(
-        torch.arange(max_seq_len),
-        1.0 / torch.pow(theta, torch.arange(0, dim, 2).to(torch.float64).div(dim)),
-    )
-    freqs = torch.polar(torch.ones_like(freqs), freqs)
-    return freqs
-
-
-@amp.autocast("cuda", enabled=False)
-def rope_apply(x, grid_sizes, freqs):
-    s, n, c = x.size(1), x.size(2), x.size(3) // 2
-
-    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
-
-    output = []
-    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
-        seq_len = f * h * w
-
-        x_i = torch.view_as_complex(x[i, :s].to(torch.float64).reshape(s, n, -1, 2))
-        freqs_i = torch.cat(
-            [
-                freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-                freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-                freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1),
-            ],
-            dim=-1,
-        ).reshape(seq_len, 1, -1)
-
-        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
-        x_i = torch.cat([x_i, x[i, seq_len:]])
-
-        output.append(x_i)
-    return torch.stack(output).float()
-
-
-def fast_rope_apply(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
-    """
-    Optimized version of rope_apply using flash_attention's rotary embedding implementation.
-    This version processes the entire batch at once for efficiency.
-
-    Args:
-        x (Tensor): Input tensor with shape [batch_size, seq_len, n_heads, head_dim]
-        freqs (Tensor): Complex frequencies with shape [max_seq_len, head_dim // 2]
-
-    Returns:
-        Tensor: Rotary-embedded tensor with same shape as input
-    """
-    batch_size, seq_len, n_heads, head_dim = x.shape
-
-    # freqs is already sharded to local seq_len under flattened CP
-    freqs = freqs.view(seq_len, head_dim // 2)
-    cos = torch.cos(freqs).to(torch.float32)
-    sin = torch.sin(freqs).to(torch.float32)
-
-    # Apply the rotation
-    rotated = flash_apply_rotary_emb(
-        x.to(torch.float32), cos, sin, interleaved=True, inplace=False
-    )
-
-    return rotated.to(x.dtype)
 
 
 class WanRMSNorm(nn.Module):
@@ -161,14 +80,12 @@ class WanSelfAttention(nn.Module):
 
         q, k, v = qkv_fn(x)
 
-        q = rope_apply(q, grid_sizes, freqs)
-        k = rope_apply(k, grid_sizes, freqs)
-        # q = fast_rope_apply(q, freqs)
-        # k = fast_rope_apply(k, freqs)
+        # q = rope_apply(q, grid_sizes, freqs)
+        # k = rope_apply(k, grid_sizes, freqs)
+        q = fast_rope_apply(q, freqs)
+        k = fast_rope_apply(k, freqs)
 
-        x = flash_attention(
-            q=q, k=k, v=v, k_lens=seq_lens, window_size=self.window_size
-        ).type_as(x)
+        x = attention(q=q, k=k, v=v).type_as(x)
 
         # output
         x = x.flatten(2)
@@ -207,9 +124,9 @@ class WanI2VCrossAttention(WanSelfAttention):
         v = self.v(context).view(b, -1, n, d)
         k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
         v_img = self.v_img(context_img).view(b, -1, n, d)
-        img_x = flash_attention(q, k_img, v_img, k_lens=None)
+        img_x = attention(q, k_img, v_img)
         # compute attention
-        x = flash_attention(q, k, v, k_lens=context_lens)
+        x = attention(q, k, v)
 
         # output
         x = x.flatten(2)
@@ -558,14 +475,9 @@ class WanModel(ModelMixin, ConfigMixin):
         self.head = Head(dim, out_dim, patch_size, eps)
 
         assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
-        d = dim // num_heads
-        self.freqs = torch.cat(
-            [
-                rope_params(1024, d - 4 * (d // 6)),
-                rope_params(1024, 2 * (d // 6)),
-                rope_params(1024, 2 * (d // 6)),
-            ],
-            dim=1,
+        self.head_dim = dim // num_heads
+        self.rope = VideoRopePosition3DEmb(
+            head_dim=self.head_dim, len_h=1024, len_w=1024, len_t=1024
         )
 
         if model_type == "i2v":
@@ -587,16 +499,16 @@ class WanModel(ModelMixin, ConfigMixin):
         if weight_init:
             self.init_weights()
 
-    def init_freqs(self):
-        d = self.dim // self.num_heads
-        self.freqs = torch.cat(
-            [
-                rope_params(1024, d - 4 * (d // 6)),
-                rope_params(1024, 2 * (d // 6)),
-                rope_params(1024, 2 * (d // 6)),
-            ],
-            dim=1,
-        )
+    # def init_freqs(self):
+    #     d = self.dim // self.num_heads
+    #     self.freqs = torch.cat(
+    #         [
+    #             rope_params(1024, d - 4 * (d // 6)),
+    #             rope_params(1024, 2 * (d // 6)),
+    #             rope_params(1024, 2 * (d // 6)),
+    #         ],
+    #         dim=1,
+    #     )
 
     def forward(
         self,
@@ -615,12 +527,14 @@ class WanModel(ModelMixin, ConfigMixin):
         # device = self.patch_embedding.weight.device
         # if self.freqs.device != device:
         #     self.freqs = self.freqs.to(device)
-        self.freqs = self.freqs.to("cuda")
-
+        B = 1
         _, T, H, W = x[0].shape
         N_t = T // self.patch_size[0]
         N_h = H // self.patch_size[1]
         N_w = W // self.patch_size[2]
+
+        freqs_shape = torch.Size([B, T, H // 2, W // 2, self.head_dim])
+        self.freqs = self.rope.generate_embeddings(B_T_H_W_C=freqs_shape)
 
         if y is not None:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]

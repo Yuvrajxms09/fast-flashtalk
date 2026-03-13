@@ -2,17 +2,12 @@
 import torch
 import torch.nn as nn
 from einops import rearrange
-from xfuser.core.distributed import (
-    get_sequence_parallel_rank,
-    get_sequence_parallel_world_size,
-)
-import xformers.ops
 
 from flash_talk.utils import (
     RotaryPositionalEmbedding1D,
     normalize_and_scale,
-    split_token_counts_and_frame_ids,
 )
+from flash_talk.kernels.attn import attention
 
 
 class SingleStreamAttention(nn.Module):
@@ -88,28 +83,7 @@ class SingleStreamAttention(nn.Module):
         encoder_k = rearrange(encoder_k, "B H M K -> B M H K")
         encoder_v = rearrange(encoder_v, "B H M K -> B M H K")
 
-        if enable_sp:
-            assert kv_seq is not None, f"kv_seq should not be None."
-            # context parallel
-            if visual_seqlen is None:
-                sp_size = get_sequence_parallel_world_size()
-                sp_rank = get_sequence_parallel_rank()
-                visual_seqlen, _ = split_token_counts_and_frame_ids(
-                    N_t, N_h * N_w, sp_size, sp_rank
-                )
-            attn_bias = xformers.ops.fmha.attn_bias.BlockDiagonalMask.from_seqlens(
-                visual_seqlen, kv_seq
-            )
-        else:
-            attn_bias = None
-
-        x = xformers.ops.memory_efficient_attention(
-            q,
-            encoder_k,
-            encoder_v,
-            attn_bias=attn_bias,
-            op=None,
-        )
+        x = attention(q, encoder_k, encoder_v)
         x = rearrange(x, "B M H K -> B H M K")
 
         # linear transform
@@ -239,13 +213,7 @@ class SingleStreamMutiAttention(SingleStreamAttention):
         q = rearrange(q, "B H M K -> B M H K")
         encoder_k = rearrange(encoder_k, "B H M K -> B M H K")
         encoder_v = rearrange(encoder_v, "B H M K -> B M H K")
-        x = xformers.ops.memory_efficient_attention(
-            q,
-            encoder_k,
-            encoder_v,
-            attn_bias=None,
-            op=None,
-        )
+        x = attention(q=q, k=encoder_k, v=encoder_v)
         x = rearrange(x, "B M H K -> B H M K")
 
         # linear transform
