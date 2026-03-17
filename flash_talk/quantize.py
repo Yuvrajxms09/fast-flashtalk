@@ -4,6 +4,11 @@ from typing import List
 import torch
 from loguru import logger
 
+from flash_talk.gemlite.helper import (
+        patch_model,
+        A8W8_int8_dynamic,
+    )
+
 
 def quantize_model_a8w8_int8_gemlite(
     model: torch.nn.Module,
@@ -17,10 +22,6 @@ def quantize_model_a8w8_int8_gemlite(
         "img_emb.proj.3",
     ],
 ) -> None:
-    from gemlite.helper import (
-        patch_model,
-        A8W8_int8_dynamic,
-    )
 
     logger.info(f"Quantizing model on {device}...")
     quant_start_time = time.perf_counter()

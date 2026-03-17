@@ -5,13 +5,15 @@ import math
 import json
 import os
 from typing import Dict
+from functools import lru_cache
+import time
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from safetensors.torch import load_file
-from optimum.quanto import quantize, freeze, qint8, requantize
+# from safetensors.torch import load_file
+# from optimum.quanto import quantize, freeze, qint8, requantize
+from loguru import logger
 
 from .tokenizers import HuggingfaceTokenizer
 
@@ -534,48 +536,25 @@ class T5EncoderModel:
         checkpoint_path=None,
         tokenizer_path=None,
         shard_fn=None,
-        quant=None,
-        quant_dir=None,
-        cache_contexts=[],
     ):
-        assert quant is None or quant in ("int8", "fp8")
         self.text_len = text_len
         self.dtype = dtype
         self.device = device
         self.checkpoint_path = checkpoint_path
         self.tokenizer_path = tokenizer_path
-        self.cache_contexts = cache_contexts
         # init model
         logging.info(f"loading {checkpoint_path}")
-        if quant is not None:
-            with torch.device("meta"):
-                model = umt5_xxl(
-                    encoder_only=True,
-                    return_tokenizer=False,
-                    dtype=dtype,
-                    device=torch.device("meta"),
-                )
-            logging.info(
-                f"Loading quantized T5 from {os.path.join(quant_dir, f't5_{quant}.safetensors')}"
+        model = (
+            umt5_xxl(
+                encoder_only=True,
+                return_tokenizer=False,
+                dtype=dtype,
+                device=device,
             )
-            model_state_dict = load_file(
-                os.path.join(quant_dir, f"t5_{quant}.safetensors")
-            )
-            with open(os.path.join(quant_dir, f"t5_map_{quant}.json"), "r") as f:
-                quantization_map = json.load(f)
-            requantize(model, model_state_dict, quantization_map, device="cpu")
-        else:
-            model = (
-                umt5_xxl(
-                    encoder_only=True,
-                    return_tokenizer=False,
-                    dtype=dtype,
-                    device=device,
-                )
-                .eval()
-                .requires_grad_(False)
-            )
-            model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"))
+            .eval()
+            .requires_grad_(False)
+        )
+        model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"))
         self.model = model
         self.model.eval().requires_grad_(False)
         if shard_fn is not None:
@@ -586,16 +565,18 @@ class T5EncoderModel:
         self.tokenizer = HuggingfaceTokenizer(
             name=tokenizer_path, seq_len=text_len, clean="whitespace"
         )
-        self.cache_contexts: Dict[str, torch.Tensor] = {}
-        for context in cache_contexts:
-            self.model.to("cuda")
-            self.cache_contexts[context] = self.predict(context).to("cpu")
-            self.model.to("cpu")
 
-    def __call__(self, texts, device):
-        ids, mask = self.tokenizer(texts, return_mask=True, add_special_tokens=True)
+    @lru_cache(maxsize=20)
+    def __call__(self, text, device):
+        start_time = time.time()
+        ids, mask = self.tokenizer([text], return_mask=True, add_special_tokens=True)
         ids = ids.to(device)
         mask = mask.to(device)
+        self.model.to(device)
         seq_lens = mask.gt(0).sum(dim=1).long()
-        context = self.model(ids, mask)
+        context = self.model(ids, mask).cpu()
+        self.model.to("cpu")
+        torch.cuda.empty_cache()
+        end_time = time.time()
+        logger.info(f"T5 encode time: {end_time - start_time} seconds")
         return [u[:v] for u, v in zip(context, seq_lens)]

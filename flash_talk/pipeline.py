@@ -277,12 +277,7 @@ class FlashTalkPipeline:
         color_correction_strength: float = 1.0,
     ):
 
-        if self.cpu_offload:
-            self.text_encoder.model.to(self.device)
-        context = self.text_encoder([input_prompt], self.device)[0]
-        if self.cpu_offload:
-            self.text_encoder.model.cpu()
-            torch.cuda.empty_cache()
+        context = self.text_encoder(input_prompt, self.device)[0].to(self.device)
 
         self.frame_num = frame_num
         self.motion_frames_num = motion_frames_num
