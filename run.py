@@ -12,7 +12,7 @@ pipeline = FlashTalkPipeline(
 image = Image(uri="examples/man.png")
 audio = Audio(uri="examples/man.mp3")
 result = pipeline.generate(
-    input_prompt="男子穿白衬衫，面向镜头。室内办公室背景，绿色植物点缀，墙上挂有城市地图，光线明亮柔和。近景，平视视角，标准镜头拍摄。写实风格。",
+    input_prompt="A person is talking. Only the foreground characters are moving, the background remains static.",
     audio=audio,
     image=image,
 )
