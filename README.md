@@ -1,6 +1,6 @@
 # Fast-FlashTalk
 
-基于 [FlashTalk](https://github.com/Soul-AI-Lab/FlashTalk) 的高性能推理优化版本，专为 RTX 4090 显卡优化，在保持生成质量的同时显著降低显存占用并提升推理速度，实测可达 **3 倍加速**。
+基于 [FlashTalk](https://github.com/Soul-AI-Lab/FlashTalk) 的高性能推理优化版本，专为 RTX 4090 显卡优化，在保持生成质量的同时显著降低显存占用并提升推理速度，实测可达 **2 倍加速**。
 
 ## 优化项
 
@@ -26,38 +26,91 @@
 
 ## 安装
 
+需要 **Python 3.11+**、支持 CUDA 的 NVIDIA GPU（推荐显存 24GB 及以上以运行 14B 模型），以及 **ffmpeg**。
 ```bash
-pip install -r requirements.txt
+# Debian/Ubuntu
+sudo apt update && sudo apt install -y ffmpeg
+# macOS（Homebrew
+brew install ffmpeg
+# conda
+conda install -c conda-forge ffmpeg
 ```
 
-## 快速使用
+```bash
+pip install fast-flashtalk
+```
+
+
+## 模型与数据准备
+
+推理前需自行准备：
+
+| 资源 | 说明 |
+|------|------|
+| **FlashTalk 权重目录** | 与 [FlashTalk / SoulX](https://github.com/Soul-AI-Lab/FlashTalk) 发布结构一致，包含 DiT、VAE、CLIP、T5 等子目录与配置 |
+| **Wav2Vec2** | 例如 `chinese-wav2vec2-base`，传入本地目录，`from_pretrained(..., local_files_only=True)` 加载 |
+
+将上述路径分别传给 `checkpoint_dir` 与 `wav2vec_dir`。
+
+## 使用说明
+
+首次创建 `FlashTalkPipeline` 时会从磁盘加载多路权重、完成量化与显存调度初始化；首次调用 `generate` 时还可能包含 CUDA 预热、部分算子首次执行等一次性开销，因此**第一次运行整体会明显慢于后续同进程内的推理**，属正常现象。同一进程内再次生成通常会快很多。
+
+### 最小示例
 
 ```python
-from flash_talk import FlashTalkPipeline
-from osc_data.image import Image
-from osc_data.audio import Audio
+from fast_flashtalk import Audio, FlashTalkPipeline, Image
+
+checkpoint_dir = "path/to/SoulX-FlashTalk-14B"
+wav2vec_dir = "path/to/chinese-wav2vec2-base"
 
 pipeline = FlashTalkPipeline(
-    checkpoint_dir="path/to/SoulX-FlashTalk-14B",
-    wav2vec_dir="path/to/chinese-wav2vec2-base",
-    num_persistent_param_in_dit=15_000_000_000,  # 常驻 GPU 的参数量，根据显存调整
+    checkpoint_dir=checkpoint_dir,
+    wav2vec_dir=wav2vec_dir,
+    num_persistent_param_in_dit=15_000_000_000,
 )
 
-image = Image(uri="path/to/image.jpeg")
-audio = Audio(uri="path/to/audio.wav")
+image = Image(uri="path/to/portrait.png")
+audio = Audio(uri="path/to/speech.wav")
 
 video = pipeline.generate(
-    input_prompt="人物描述和场景描述",
+    input_prompt="人物与场景描述，用于引导画面风格与内容。",
     audio=audio,
     image=image,
-    force_9_16=True,  # 强制 9:16 宽高比
 )
+# 返回 osc_data.Video；未指定 video_save_path 时默认写入 sample_results/res_<时间戳>.mp4
 ```
 
-### 参数说明
+`Image`、`Audio` 使用 `uri` 指向本地图片或音频文件；音频会按管线内配置的采样率重采样。
+
+### `FlashTalkPipeline` 主要参数
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `checkpoint_dir` | str | - | FlashTalk 模型权重目录 |
-| `wav2vec_dir` | str | - | Wav2Vec2 模型目录 |
-| `num_persistent_param_in_dit` | int | 15B | 常驻 GPU 的 DiT 参数量，显存不足时调小 |
+| `checkpoint_dir` | `str` | 必填 | FlashTalk 模型权重根目录 |
+| `wav2vec_dir` | `str` | 必填 | Wav2Vec2 模型本地目录 |
+| `device` | `str` | `"cuda"` | 推理设备 |
+| `cpu_offload` | `bool` | `True` | 是否将部分模块放在 CPU 上以节省显存 |
+| `num_timesteps` | `int` | `1000` | 扩散时间步数 |
+| `use_timestep_transform` | `bool` | `True` | 是否对时间步做变换调度 |
+| `num_persistent_param_in_dit` | `int` | `10_000_000_000` | 常驻 GPU 的 DiT 参数个数上限，显存紧张时适当调小 |
+| `quantize` | `bool` | `True` | 是否对 DiT 做 GemLite A8W8 量化 |
+| `use_usp` | `bool` | `False` | 分布式 USP 策略（一般单机保持 `False`） |
+
+### `generate` 主要参数
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `input_prompt` | `str` | 必填 | 文本提示，描述人物、场景、镜头等 |
+| `audio` | `Audio` | 必填 | 驱动口型与节奏的音频 |
+| `image` | `Image` | 必填 | 条件图像（人物/画面参考） |
+| `audio_encode_mode` | `"stream"` \| `"once"` | `"once"` | 音频编码方式：`once` 整段编码后按块切分；`stream` 按流式块编码，更省内存 |
+| `video_save_path` | `str \| None` | `None` | 输出 MP4 路径；为 `None` 时写入 `sample_results/res_<时间戳>.mp4` |
+| `merge_video_audio` | `bool` | `True` | 是否将生成画面与原始音频合并到输出文件 |
+| `force_9_16` | `bool` | `False` | 是否强制竖屏 9:16 输出 |
+
+返回值类型为 `osc_data.video.Video`，可通过 `.data` 等属性访问帧数据（具体以 `osc_data` 文档为准）。
+
+## 许可证与致谢
+
+上游实现与权重归属请参考 [FlashTalk](https://github.com/Soul-AI-Lab/FlashTalk) 及相应模型许可。
