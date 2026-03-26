@@ -43,14 +43,12 @@ pip install fast-flashtalk
 
 ## 模型与数据准备
 
-推理前需自行准备：
+推理前需自行下载模型权重：
 
-| 资源 | 说明 |
-|------|------|
-| **FlashTalk 权重目录** | 与 [FlashTalk / SoulX](https://github.com/Soul-AI-Lab/FlashTalk) 发布结构一致，包含 DiT、VAE、CLIP、T5 等子目录与配置 |
-| **Wav2Vec2** | 例如 `chinese-wav2vec2-base`，传入本地目录，`from_pretrained(..., local_files_only=True)` 加载 |
-
-将上述路径分别传给 `checkpoint_dir` 与 `wav2vec_dir`。
+```
+modelscope download Soul-AILab/SoulX-FlashTalk-14B --local_dir checkpoints/Soul-AILab/SoulX-FlashTalk-14B
+modelscope download TencentGameMate/chinese-wav2vec2-base --local_dir checkpoints/TencentGameMate/chinese-wav2vec2-basechinese-wav2vec2-base
+```
 
 ## 使用说明
 
@@ -89,13 +87,7 @@ video = pipeline.generate(
 |------|------|--------|------|
 | `checkpoint_dir` | `str` | 必填 | FlashTalk 模型权重根目录 |
 | `wav2vec_dir` | `str` | 必填 | Wav2Vec2 模型本地目录 |
-| `device` | `str` | `"cuda"` | 推理设备 |
-| `cpu_offload` | `bool` | `True` | 是否将部分模块放在 CPU 上以节省显存 |
-| `num_timesteps` | `int` | `1000` | 扩散时间步数 |
-| `use_timestep_transform` | `bool` | `True` | 是否对时间步做变换调度 |
 | `num_persistent_param_in_dit` | `int` | `10_000_000_000` | 常驻 GPU 的 DiT 参数个数上限，显存紧张时适当调小 |
-| `quantize` | `bool` | `True` | 是否对 DiT 做 GemLite A8W8 量化 |
-| `use_usp` | `bool` | `False` | 分布式 USP 策略（一般单机保持 `False`） |
 
 ### `generate` 主要参数
 
