@@ -73,36 +73,22 @@ class FlashTalkPipeline:
         checkpoint_dir,
         wav2vec_dir,
         device="cuda",
-        use_usp=False,
-        cpu_offload=True,
         num_timesteps=1000,
         use_timestep_transform=True,
-        num_persistent_param_in_dit=10_000_000_000,
-        quantize: bool = True,
-        **kwargs,
+        num_persistent_param_in_dit=15_000_000_000,
     ):
-        r"""
-        Initializes the image-to-video generation model components.
-        Reference from InfiniteTalkPipeline: https://github.com/MeiGen-AI/InfiniteTalk/blob/main/wan/multitalk.py
+        """FlashTalkPipeline for RTX 4090 GPU.
         Args:
-            config (EasyDict):
-                Object containing model parameters initialized from config.py
             checkpoint_dir (`str`):
                 Path to directory containing model checkpoints
             wav2vec_dir (`str`):
                 Path to directory containing wav2vec checkpoints
-            use_usp (`bool`, *optional*, defaults to False):
-                Enable distribution strategy of USP.
-            cpu_offload (`bool`, *optional*, defaults to False):
-                Enable CPU offload.
             num_timesteps (`int`, *optional*, defaults to 1000):
                 Number of timesteps.
             use_timestep_transform (`bool`, *optional*, defaults to True):
                 Enable timestep transform.
             num_persistent_param_in_dit (`int`, *optional*, defaults to 15_000_000_000):
                 Number of persistent parameters in DIT model.
-            quantize (`bool`, *optional*, defaults to True):
-                Enable quantization.
         """
         self.device = device
         config = multitalk_14B
@@ -113,7 +99,7 @@ class FlashTalkPipeline:
         self.rank = 0
         self.use_usp = False
         self.param_dtype = config.param_dtype
-        self.cpu_offload = cpu_offload and not self.use_usp
+        self.cpu_offload = True
 
         self.text_encoder = T5EncoderModel(
             text_len=config.text_len,
@@ -130,7 +116,7 @@ class FlashTalkPipeline:
             vae_path=os.path.join(checkpoint_dir, config.vae_checkpoint),
             dtype=self.param_dtype,
             device="cpu" if self.cpu_offload else self.device,
-            parallel=(USE_PARALLEL_VAE and self.use_usp),
+            parallel=False,
         )
 
         self.clip = CLIPModel(
@@ -148,10 +134,9 @@ class FlashTalkPipeline:
             torch_dtype=self.param_dtype,
         )
         self.model.eval().requires_grad_(False)
-        if quantize:
-            quantize_model_a8w8_int8_gemlite(self.model, device="cuda")
-            self.model.cpu()
-            torch.cuda.empty_cache()
+        quantize_model_a8w8_int8_gemlite(self.model, device="cuda")
+        self.model.cpu()
+        torch.cuda.empty_cache()
         logger.info(
             f"Enable low vram mode with num_persistent_param_in_dit: {num_persistent_param_in_dit}"
         )
@@ -164,22 +149,15 @@ class FlashTalkPipeline:
         self.num_timesteps = num_timesteps
         self.use_timestep_transform = use_timestep_transform
 
-        if COMPILE_MODEL and not self.cpu_offload:
-            self.model = torch.compile(self.model)
-        if COMPILE_VAE and not self.cpu_offload:
-            self.vae.encode = torch.compile(self.vae.encode)
-            self.vae.decode = torch.compile(self.vae.decode)
-
         self.audio_encoder = Wav2Vec2Model.from_pretrained(
             wav2vec_dir, local_files_only=True
-        ).to("cpu" if self.cpu_offload else self.device)
+        ).to("cpu")
         self.audio_encoder.feature_extractor._freeze_parameters()
         self.wav2vec_feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(
             wav2vec_dir, local_files_only=True
         )
 
         self.model_names = ["model"]
-        self.sp_size = 1
 
     def enable_vram_management(self, num_persistent_param_in_dit=0):
         dtype = next(iter(self.model.parameters())).dtype
@@ -342,7 +320,7 @@ class FlashTalkPipeline:
             * self.lat_w
             // (self.patch_size[1] * self.patch_size[2])
         )
-        max_seq_len = int(math.ceil(max_seq_len / self.sp_size)) * self.sp_size
+        max_seq_len = int(math.ceil(max_seq_len / 1)) * 1
 
         self.generator = torch.Generator(device=self.device).manual_seed(seed)
 
