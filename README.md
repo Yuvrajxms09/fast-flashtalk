@@ -1,6 +1,6 @@
 # Fast-FlashTalk
 
-基于 [FlashTalk](https://github.com/Soul-AI-Lab/FlashTalk) 的高性能推理优化版本，专为 RTX 4090 显卡优化，在保持生成质量的同时显著降低显存占用并提升推理速度，实测可达 **2 倍加速**。
+基于 [FlashTalk](https://github.com/Soul-AILab/SoulX-FlashTalk) 的高性能推理优化版本，专为 RTX 4090 显卡优化，在保持生成质量的同时显著降低显存占用并提升推理速度，实测可达 **2 倍加速**。
 
 ## 优化项
 
@@ -105,4 +105,4 @@ video = pipeline.generate(
 
 ## 许可证与致谢
 
-上游实现与权重归属请参考 [FlashTalk](https://github.com/Soul-AI-Lab/FlashTalk) 及相应模型许可。
+上游实现与权重归属请参考 [FlashTalk](https://github.com/Soul-AILab/SoulX-FlashTalk)及相应模型许可。
