@@ -76,7 +76,9 @@ video = pipeline.generate(
     audio=audio,
     image=image,
 )
-# 返回 osc_data.Video；未指定 video_save_path 时默认写入 sample_results/res_<时间戳>.mp4
+# 添加音频与视频合并
+#video.merge_audio(audio)
+video.save("test.mp4")
 ```
 
 `Image`、`Audio` 使用 `uri` 指向本地图片或音频文件；音频会按管线内配置的采样率重采样。
@@ -97,9 +99,6 @@ video = pipeline.generate(
 | `audio` | `Audio` | 必填 | 驱动口型与节奏的音频 |
 | `image` | `Image` | 必填 | 条件图像（人物/画面参考） |
 | `audio_encode_mode` | `"stream"` \| `"once"` | `"once"` | 音频编码方式：`once` 整段编码后按块切分；`stream` 按流式块编码，更省内存 |
-| `video_save_path` | `str \| None` | `None` | 输出 MP4 路径；为 `None` 时写入 `sample_results/res_<时间戳>.mp4` |
-| `merge_video_audio` | `bool` | `True` | 是否将生成画面与原始音频合并到输出文件 |
-| `force_9_16` | `bool` | `False` | 是否强制竖屏 9:16 输出 |
 
 返回值类型为 `osc_data.video.Video`，可通过 `.data` 等属性访问帧数据（具体以 `osc_data` 文档为准）。
 
