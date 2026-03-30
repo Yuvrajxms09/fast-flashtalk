@@ -77,8 +77,9 @@ video = pipeline.generate(
     image=image,
 )
 # 添加音频与视频合并
-#video.merge_audio(audio)
-video.save("test.mp4")
+#video.merge_audio(audio, output_path="test.mp4")
+# 仅保存视频
+#video.save("test.mp4")
 ```
 
 `Image`、`Audio` 使用 `uri` 指向本地图片或音频文件；音频会按管线内配置的采样率重采样。
