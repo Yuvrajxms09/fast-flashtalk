@@ -207,5 +207,8 @@ marimo/_lsp/
 __marimo__/
 sample_results
 flashtalk_test_assets
+
+# Local entry script (machine-specific paths)
+run.py
 *.ipynb
 .python-version

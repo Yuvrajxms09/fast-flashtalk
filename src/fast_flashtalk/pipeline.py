@@ -5,7 +5,6 @@ import time
 import yaml
 from typing import Literal
 from collections import deque
-from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -25,7 +24,6 @@ from .utils import (
     match_and_blend_colors_torch,
     resize_and_centercrop,
     loudness_norm,
-    save_video_ffmpeg,
 )
 from .quantize import quantize_model_a8w8_int8_gemlite
 from .gemlite.core import GemLiteLinear
@@ -499,8 +497,8 @@ class FlashTalkPipeline:
                     self.latent_motion_frames
                 )
 
-            self.offload_dit_model()
-            
+            # self.offload_dit_model()
+
             if self.cpu_offload:
                 self.vae.model.to(self.device)
                 self.vae.scale[0] = self.vae.scale[0].to(self.device)
@@ -553,10 +551,6 @@ class FlashTalkPipeline:
         audio: Audio,
         image: Image,
         audio_encode_mode: Literal["stream", "once"] = "once",
-        video_save_path: str | None = None,
-        merge_video_audio: bool = True,
-        force_9_16: bool = False,
-        **kwargs,
     ) -> Video:
         """
         Generate video from the audio and image prompt.
@@ -712,30 +706,6 @@ class FlashTalkPipeline:
             self.offload_dit_model()
         video_array = torch.cat(generated_list, dim=0).numpy().astype(np.uint8)
         video = Video(data=video_array, prompt=input_prompt, fps=tgt_fps)
-        # if merge_video_audio:
-        #     video = video.merge_audio(audio=audio)
-        # if force_9_16:
-        #     height, width = video.get_best_size(ratio=(9, 16))
-        #     logger.info(f"Resize video to {height}x{width}")
-        #     video = video.resize(height=height, width=width)
-        if video_save_path is None:
-            output_dir = "sample_results"
-            if not os.path.exists(output_dir):
-                os.makedirs(output_dir)
-            timestamp = datetime.now().strftime("%Y%m%d-%H:%M:%S-%f")[:-3]
-            filename = f"res_{timestamp}.mp4"
-            filepath = os.path.join(output_dir, filename)
-            video_save_path = filepath
-        # video.save(video_save_path)
-        save_video_ffmpeg(
-            save_path=video_save_path,
-            gen_video_samples=video.data,
-            audio_samples=audio.data,
-            fps=tgt_fps,
-            audio_sample_rate=audio.sample_rate,
-            force_9_16=force_9_16,
-            merge_video_audio=merge_video_audio,
-        )
         generate_end_time = time.perf_counter()
         logger.info(
             f"FlashTalk Pipeline Generate time: {generate_end_time - generate_start_time:.2f}s"

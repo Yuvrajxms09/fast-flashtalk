@@ -34,7 +34,6 @@ def attention(
     q = q.to(v.dtype)
     k = k.to(v.dtype)
     if L_k < 512:
-        # return flash_attn_func(q, k, v)
         with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
             return scaled_dot_product_attention(
                 q.permute(0, 2, 1, 3), k.permute(0, 2, 1, 3), v.permute(0, 2, 1, 3)

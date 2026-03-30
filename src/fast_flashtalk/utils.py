@@ -1,25 +1,17 @@
 import os
 from einops import rearrange
 import binascii
-import os.path as osp
 from functools import lru_cache
-import subprocess
 import math
-from pathlib import Path
-import tempfile
 
 import torch
 import torch.nn as nn
 from einops import repeat
-import imageio
 import numpy as np
-import torchvision
 from skimage import color
-from PIL import Image
 import torchvision.transforms as transforms
 import pyloudnorm as pyln
 from loguru import logger
-import soundfile as sf
 
 
 VID_EXTENSIONS = (".mp4", ".avi", ".mov", ".mkv")
@@ -241,52 +233,6 @@ def rand_name(length=8, suffix=""):
             suffix = "." + suffix
         name += suffix
     return name
-
-
-def cache_video(
-    tensor,
-    save_file=None,
-    fps=30,
-    suffix=".mp4",
-    nrow=8,
-    normalize=True,
-    value_range=(-1, 1),
-    retry=5,
-):
-
-    # cache file
-    cache_file = (
-        osp.join("/tmp", rand_name(suffix=suffix)) if save_file is None else save_file
-    )
-
-    # save to cache
-    error = None
-    for _ in range(retry):
-        # preprocess
-        tensor = tensor.clamp(min(value_range), max(value_range))
-        tensor = torch.stack(
-            [
-                torchvision.utils.make_grid(
-                    u, nrow=nrow, normalize=normalize, value_range=value_range
-                )
-                for u in tensor.unbind(2)
-            ],
-            dim=1,
-        ).permute(1, 2, 3, 0)
-        tensor = (tensor * 255).type(torch.uint8).cpu()
-
-        # write video
-        writer = imageio.get_writer(
-            cache_file,
-            fps=fps,
-            codec="libx264",
-            quality=10,
-            ffmpeg_params=["-crf", "10"],
-        )
-        for frame in tensor.numpy():
-            writer.append_data(frame)
-        writer.close()
-        return cache_file
 
 
 class MomentumBuffer:
@@ -639,17 +585,14 @@ def match_and_blend_colors_torch(
 
 
 def resize_and_centercrop(
-    cond_image: torch.Tensor | Image.Image, target_size: tuple[int, int]
+    cond_image: torch.Tensor, target_size: tuple[int, int]
 ) -> torch.Tensor:
     """
     Resize image or tensor to the target size without padding.
     """
 
     # Get the original size
-    if isinstance(cond_image, torch.Tensor):
-        _, orig_h, orig_w = cond_image.shape
-    else:
-        orig_h, orig_w = cond_image.height, cond_image.width
+    _, orig_h, orig_w = cond_image.shape
 
     target_h, target_w = target_size
 
@@ -663,26 +606,18 @@ def resize_and_centercrop(
     final_w = math.ceil(scale * orig_w)
 
     # Resize
-    if isinstance(cond_image, torch.Tensor):
-        if len(cond_image.shape) == 3:
-            cond_image = cond_image[None]
-        resized_tensor = nn.functional.interpolate(
-            cond_image, size=(final_h, final_w), mode="nearest"
-        ).contiguous()
-        # crop
-        cropped_tensor = transforms.functional.center_crop(resized_tensor, target_size)
-        # cropped_tensor = cropped_tensor.squeeze(0)
-        cropped_tensor = cropped_tensor[:, :, None, :, :]
-    else:
-        resized_image = cond_image.resize((final_w, final_h), resample=Image.BILINEAR)
-        resized_image = np.array(resized_image)
-        # tensor and crop
-        resized_tensor = (
-            torch.from_numpy(resized_image)[None, ...].permute(0, 3, 1, 2).contiguous()
-        )
-        cropped_tensor = transforms.functional.center_crop(resized_tensor, target_size)
-        cropped_tensor = cropped_tensor[:, :, None, :, :]
-    logger.info(f"Original image: {orig_h}x{orig_w}, resized image: {final_h}x{final_w}, cropped image: {target_h}x{target_w}")
+    if len(cond_image.shape) == 3:
+        cond_image = cond_image[None]
+    resized_tensor = nn.functional.interpolate(
+        cond_image, size=(final_h, final_w), mode="nearest"
+    ).contiguous()
+    # crop
+    cropped_tensor = transforms.functional.center_crop(resized_tensor, target_size)
+    # cropped_tensor = cropped_tensor.squeeze(0)
+    cropped_tensor = cropped_tensor[:, :, None, :, :]
+    logger.info(
+        f"Original image: {orig_h}x{orig_w}, resized image: {final_h}x{final_w}, cropped image: {target_h}x{target_w}"
+    )
     return cropped_tensor
 
 
@@ -693,166 +628,3 @@ def loudness_norm(audio_array, sr=16000, lufs=-23):
         return audio_array
     normalized_audio = pyln.normalize.loudness(audio_array, loudness, lufs)
     return normalized_audio
-
-
-def save_video_ffmpeg(
-    save_path: str | Path,
-    gen_video_samples: np.ndarray,
-    audio_samples: np.ndarray,
-    audio_sample_rate: int = 16000,
-    fps: int = 25,
-    encoders: list[str] = ["libx264", "libopenh264"],
-    merge_video_audio: bool = True,
-    force_9_16: bool = False,
-):
-    """使用ffmpeg命令保存视频和音频到指定路径,视频保存为mp4格式,音频保存为wav格式,并使用指定的编码器进行编码.
-
-    Args:
-        save_path (str): 保存路径
-        gen_video_samples (torch.Tensor): 视频样本
-        audio_samples (np.ndarray): 音频样本
-        audio_sample_rate (int, optional): 音频采样率. Defaults to 16000.
-        fps (int, optional): 视频帧率. Defaults to 25.
-        quality (int, optional): 视频质量. Defaults to 9.
-        encoders (list[str], optional): 视频编码器. Defaults to ["libopenh264", "libx264"]. 可选择多个编码器,先尝试第一个,如果失败则尝试第二个.
-        force_9_16 (bool, optional): Whether to force 9:16 aspect ratio. Defaults to False.
-    """
-    save_path = Path(save_path)
-    save_path.parent.mkdir(parents=True, exist_ok=True)
-    # 找出ffmpeg支持的编码器
-    encoders = [encoder for encoder in encoders if ffmpeg_has_encoder(encoder)]
-    if len(encoders) == 0:
-        logger.error("No supported encoders found")
-        raise RuntimeError("No supported encoders found")
-    encoder = encoders[0]
-    logger.info(f"Using encoder: {encoder}")
-    with tempfile.TemporaryDirectory() as temp_dir:
-        video_audio = gen_video_samples.astype(np.uint8)
-        save_path_tmp = Path(temp_dir) / "video-temp.mp4"
-        logger.info(f"Saving video to {save_path_tmp}")
-        save_video(video_audio, save_path_tmp, fps=fps)
-        if force_9_16:
-            logger.info("Forcing 9:16 aspect ratio")
-            output_path = Path(temp_dir) / "video-temp-9-16.mp4"
-            # ffmpeg强制9：16尺寸
-            cmd = [
-                "ffmpeg",
-                "-y",
-                "-i",
-                str(save_path_tmp),
-                "-vf",
-                "crop=if(gt(iw/ih\,9/16)\,ih*9/16\,iw):if(gt(iw/ih\,9/16)\,ih\,iw*16/9):if(gt(iw/ih\,9/16)\,(iw-ih*9/16)/2\,0):if(gt(iw/ih\,9/16)\,0\,(ih-iw*16/9)/2)",
-                "-c:v",
-                encoder,
-                "-c:a",
-                "copy",
-                str(output_path),
-            ]
-            subprocess.run(
-                cmd, check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE
-            )
-            save_path_tmp = output_path
-            logger.info(f"9:16 video saved to {save_path_tmp}")
-        if not merge_video_audio:
-            logger.info("Skipping video and audio merge")
-            # 仅ffmpeg保存视频到指定路径,使用encoder进行编码
-            result = None
-            ffmpeg_command = [
-                "ffmpeg",
-                "-y",
-                "-i",
-                str(save_path_tmp),
-                "-c:v",
-                encoder,
-                str(save_path),
-            ]
-            try:
-                result = subprocess.run(
-                    ffmpeg_command, check=True, stderr=subprocess.PIPE
-                )
-                logger.info(
-                    f"Successfully saved video to {save_path} with encoder {encoder}"
-                )
-            except subprocess.CalledProcessError as e:
-                logger.warning(
-                    f"Failed to save video to {save_path} with encoder {encoder}: {e.stderr.decode('utf-8')}"
-                )
-            if result is None or result.returncode != 0:
-                logger.error("Failed to save video to {save_path} with any encoder")
-                raise RuntimeError("Failed to save video to {save_path}")
-            os.remove(save_path_tmp)
-            return
-
-        # random name for audio
-        audio_save_path = Path(temp_dir) / "audio-temp.wav"
-        logger.info(f"Saving audio to {audio_save_path}")
-        save_audio(audio_samples, audio_save_path, audio_sample_rate)
-
-        # crop audio according to video length
-        _, T, _, _ = gen_video_samples.shape
-        duration = T / fps
-        save_path_crop_audio = Path(temp_dir) / f"audio-crop-temp-{duration}.wav"
-        logger.info(f"Cropping audio to {save_path_crop_audio}")
-        crop_audio_command = [
-            "ffmpeg",
-            "-i",
-            audio_save_path,
-            "-t",
-            f"{duration}",
-            save_path_crop_audio,
-        ]
-        subprocess.run(
-            crop_audio_command,
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-
-        logger.info(f"Merging video and audio with encoder: {encoder}")
-        merge_video_audio_command = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(save_path_tmp),
-            "-i",
-            str(save_path_crop_audio),
-            "-c:v",
-            encoder,
-            "-c:a",
-            "aac",
-            "-shortest",
-            "-movflags",
-            "+faststart",
-            str(save_path),
-        ]
-        # 合并视频和音频
-        subprocess.run(merge_video_audio_command, check=True, stderr=subprocess.PIPE)
-        logger.info(f"Successfully merged video and audio to {save_path}")
-        os.remove(save_path_tmp)
-        os.remove(save_path_crop_audio)
-        os.remove(audio_save_path)
-        logger.info("Removed all temporary files")
-
-
-def save_video(frames, save_path, fps):
-    writer = imageio.get_writer(
-        save_path, fps=fps
-    )
-    for frame in frames:
-        frame = np.array(frame)
-        writer.append_data(frame)
-    writer.close()
-
-
-def save_audio(audio_array: np.ndarray, save_path: str, sample_rate: int):
-    sf.write(save_path, audio_array, sample_rate)
-
-
-def ffmpeg_has_encoder(name: str) -> bool:
-    proc = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-encoders"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-    return f" {name} " in proc.stdout
