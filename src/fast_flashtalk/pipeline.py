@@ -76,6 +76,7 @@ class FlashTalkPipeline:
         num_timesteps=1000,
         use_timestep_transform=True,
         num_persistent_param_in_dit=15_000_000_000,
+        keep_dit_on_gpu=False,
     ):
         """FlashTalkPipeline for RTX 4090 GPU.
         Args:
@@ -100,6 +101,7 @@ class FlashTalkPipeline:
         self.use_usp = False
         self.param_dtype = config.param_dtype
         self.cpu_offload = True
+        self.keep_dit_on_gpu = keep_dit_on_gpu
 
         self.text_encoder = T5EncoderModel(
             text_len=config.text_len,
@@ -130,20 +132,24 @@ class FlashTalkPipeline:
 
         self.model = WanModel.from_pretrained(
             checkpoint_dir,
-            device_map="cpu" if self.cpu_offload else self.device,
+            device_map=self.device if self.keep_dit_on_gpu else "cpu",
             torch_dtype=self.param_dtype,
         )
         self.model.eval().requires_grad_(False)
         quantize_model_a8w8_int8_gemlite(self.model, device="cuda")
-        self.model.cpu()
-        torch.cuda.empty_cache()
-        logger.info(
-            f"Enable low vram mode with num_persistent_param_in_dit: {num_persistent_param_in_dit}"
-        )
-        self.vram_management = False
-        self.enable_vram_management(
-            num_persistent_param_in_dit=num_persistent_param_in_dit
-        )
+        if self.keep_dit_on_gpu:
+            logger.info("Keeping DiT fully resident on GPU (no VRAM management).")
+            self.vram_management = False
+        else:
+            self.model.cpu()
+            torch.cuda.empty_cache()
+            logger.info(
+                f"Enable low vram mode with num_persistent_param_in_dit: {num_persistent_param_in_dit}"
+            )
+            self.vram_management = False
+            self.enable_vram_management(
+                num_persistent_param_in_dit=num_persistent_param_in_dit
+            )
 
         self.sample_neg_prompt = config.sample_neg_prompt
         self.num_timesteps = num_timesteps
