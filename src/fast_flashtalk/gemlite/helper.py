@@ -47,7 +47,7 @@ def patch_model(
     if hasattr(processor, "from_hqqlinear"):
         try:
             from hqq.core.quantize import HQQLinear, BaseQuantizeConfig
-        except ImportException:
+        except ImportError:
             print(
                 "This processor requires the `hqq` package. Install it via `pip install hqq`."
             )
@@ -1296,7 +1296,7 @@ def warmup(
     if hasattr(processor, "from_hqqlinear"):
         try:
             from hqq.core.quantize import HQQLinear, BaseQuantizeConfig
-        except ImportException:
+        except ImportError:
             print(
                 "This processor requires the `hqq` package. Install it via `pip install hqq`."
             )

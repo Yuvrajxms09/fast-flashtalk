@@ -25,7 +25,7 @@ from .utils import (
     resize_and_centercrop,
     loudness_norm,
 )
-from .quantize import quantize_model_a8w8_int8_gemlite
+from .quantize import quantize_model_a8w8_int8_gemlite, quantize_model_a8w4_hqq_gemlite
 from .gemlite.core import GemLiteLinear
 from .vram_management import (
     enable_vram_management,
@@ -77,6 +77,7 @@ class FlashTalkPipeline:
         use_timestep_transform=True,
         num_persistent_param_in_dit=15_000_000_000,
         keep_dit_on_gpu=False,
+        weight_bits=8,
     ):
         """FlashTalkPipeline for RTX 4090 GPU.
         Args:
@@ -90,6 +91,8 @@ class FlashTalkPipeline:
                 Enable timestep transform.
             num_persistent_param_in_dit (`int`, *optional*, defaults to 15_000_000_000):
                 Number of persistent parameters in DIT model.
+            weight_bits (`int`, *optional*, defaults to 8):
+                DiT weight quantization bit-width. Supported values are 8 and 4.
         """
         self.device = device
         config = multitalk_14B
@@ -102,6 +105,7 @@ class FlashTalkPipeline:
         self.param_dtype = config.param_dtype
         self.cpu_offload = True
         self.keep_dit_on_gpu = keep_dit_on_gpu
+        self.weight_bits = weight_bits
 
         self.text_encoder = T5EncoderModel(
             text_len=config.text_len,
@@ -136,7 +140,14 @@ class FlashTalkPipeline:
             torch_dtype=self.param_dtype,
         )
         self.model.eval().requires_grad_(False)
-        quantize_model_a8w8_int8_gemlite(self.model, device="cuda")
+        if self.weight_bits == 8:
+            quantize_model_a8w8_int8_gemlite(self.model, device="cuda")
+        elif self.weight_bits == 4:
+            quantize_model_a8w4_hqq_gemlite(self.model, device="cuda")
+        else:
+            raise ValueError(
+                f"Unsupported weight_bits={self.weight_bits}; expected 8 or 4."
+            )
         if self.keep_dit_on_gpu:
             logger.info("Keeping DiT fully resident on GPU (no VRAM management).")
             self.vram_management = False
