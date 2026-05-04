@@ -97,6 +97,10 @@ class FlashTalkPipeline:
         self.device = device
         config = multitalk_14B
         self.config = config
+        if weight_bits not in (4, 8):
+            raise ValueError(
+                f"Unsupported weight_bits={weight_bits}; expected 8 or 4."
+            )
 
         with open(Path(__file__).parent / "configs" / "infer_params.yaml", "r") as f:
             self.infer_params = yaml.safe_load(f)
