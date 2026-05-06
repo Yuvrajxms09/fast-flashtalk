@@ -77,6 +77,7 @@ class FlashTalkPipeline:
         use_timestep_transform=True,
         num_persistent_param_in_dit=15_000_000_000,
         keep_dit_on_gpu=False,
+        quantize_weights=True,
         weight_bits=8,
     ):
         """FlashTalkPipeline for RTX 4090 GPU.
@@ -91,13 +92,17 @@ class FlashTalkPipeline:
                 Enable timestep transform.
             num_persistent_param_in_dit (`int`, *optional*, defaults to 15_000_000_000):
                 Number of persistent parameters in DIT model.
+            quantize_weights (`bool`, *optional*, defaults to True):
+                Quantize DiT weights at load time using GemLite. Set to False to keep
+                the checkpoint weights in their original dtype and rely on VRAM
+                management only.
             weight_bits (`int`, *optional*, defaults to 8):
                 DiT weight quantization bit-width. Supported values are 8 and 4.
         """
         self.device = device
         config = multitalk_14B
         self.config = config
-        if weight_bits not in (4, 8):
+        if quantize_weights and weight_bits not in (4, 8):
             raise ValueError(
                 f"Unsupported weight_bits={weight_bits}; expected 8 or 4."
             )
@@ -109,6 +114,7 @@ class FlashTalkPipeline:
         self.param_dtype = config.param_dtype
         self.cpu_offload = True
         self.keep_dit_on_gpu = keep_dit_on_gpu
+        self.quantize_weights = quantize_weights
         self.weight_bits = weight_bits
 
         self.text_encoder = T5EncoderModel(
@@ -144,13 +150,18 @@ class FlashTalkPipeline:
             torch_dtype=self.param_dtype,
         )
         self.model.eval().requires_grad_(False)
-        if self.weight_bits == 8:
-            quantize_model_a8w8_int8_gemlite(self.model, device="cuda")
-        elif self.weight_bits == 4:
-            quantize_model_a8w4_hqq_gemlite(self.model, device="cuda")
+        if self.quantize_weights:
+            if self.weight_bits == 8:
+                quantize_model_a8w8_int8_gemlite(self.model, device="cuda")
+            elif self.weight_bits == 4:
+                quantize_model_a8w4_hqq_gemlite(self.model, device="cuda")
+            else:
+                raise ValueError(
+                    f"Unsupported weight_bits={self.weight_bits}; expected 8 or 4."
+                )
         else:
-            raise ValueError(
-                f"Unsupported weight_bits={self.weight_bits}; expected 8 or 4."
+            logger.info(
+                "Skipping DiT weight quantization; using checkpoint weights as loaded."
             )
         if self.keep_dit_on_gpu:
             logger.info("Keeping DiT fully resident on GPU (no VRAM management).")
