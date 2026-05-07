@@ -76,7 +76,7 @@ class FlashTalkPipeline:
         num_timesteps=1000,
         use_timestep_transform=True,
         num_persistent_param_in_dit=15_000_000_000,
-        keep_dit_on_gpu=False,
+        keep_dit_on_gpu=True,
         quantize_weights=True,
         weight_bits=8,
     ):
@@ -112,7 +112,7 @@ class FlashTalkPipeline:
         self.rank = 0
         self.use_usp = False
         self.param_dtype = config.param_dtype
-        self.cpu_offload = True
+        self.cpu_offload = False
         self.keep_dit_on_gpu = keep_dit_on_gpu
         self.quantize_weights = quantize_weights
         self.weight_bits = weight_bits
@@ -123,6 +123,7 @@ class FlashTalkPipeline:
             device="cpu" if self.cpu_offload else self.device,
             checkpoint_path=os.path.join(checkpoint_dir, config.t5_checkpoint),
             tokenizer_path=os.path.join(checkpoint_dir, config.t5_tokenizer),
+            offload_to_cpu=self.cpu_offload,
         )
 
         self.vae_stride = config.vae_stride
@@ -183,7 +184,7 @@ class FlashTalkPipeline:
 
         self.audio_encoder = Wav2Vec2Model.from_pretrained(
             wav2vec_dir, local_files_only=True
-        ).to("cpu")
+        ).to("cpu" if self.cpu_offload else self.device)
         self.audio_encoder.feature_extractor._freeze_parameters()
         self.wav2vec_feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(
             wav2vec_dir, local_files_only=True

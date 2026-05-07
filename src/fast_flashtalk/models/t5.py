@@ -531,12 +531,14 @@ class T5EncoderModel:
         checkpoint_path=None,
         tokenizer_path=None,
         shard_fn=None,
+        offload_to_cpu=True,
     ):
         self.text_len = text_len
         self.dtype = dtype
         self.device = device
         self.checkpoint_path = checkpoint_path
         self.tokenizer_path = tokenizer_path
+        self.offload_to_cpu = offload_to_cpu
         # init model
         logging.info(f"loading {checkpoint_path}")
         model = (
@@ -569,9 +571,11 @@ class T5EncoderModel:
         mask = mask.to(device)
         self.model.to(device)
         seq_lens = mask.gt(0).sum(dim=1).long()
-        context = self.model(ids, mask).cpu()
-        self.model.to("cpu")
-        torch.cuda.empty_cache()
+        context = self.model(ids, mask)
+        if self.offload_to_cpu:
+            context = context.cpu()
+            self.model.to("cpu")
+            torch.cuda.empty_cache()
         end_time = time.time()
         logger.info(f"T5 encode time: {end_time - start_time} seconds")
         return [u[:v] for u, v in zip(context, seq_lens)]
