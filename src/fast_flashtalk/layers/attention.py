@@ -54,6 +54,7 @@ class SingleStreamAttention(nn.Module):
         enable_sp=False,
         kv_seq=None,
         visual_seqlen=None,
+        cached_kv=None,
     ) -> torch.Tensor:
 
         N_t, N_h, N_w = shape
@@ -70,11 +71,14 @@ class SingleStreamAttention(nn.Module):
             q = self.q_norm(q)
 
         # get kv from encoder_hidden_states
-        _, N_a, _ = encoder_hidden_states.shape
-        encoder_kv = self.kv_linear(encoder_hidden_states)
-        encoder_kv_shape = (B, N_a, 2, self.num_heads, self.head_dim)
-        encoder_kv = encoder_kv.view(encoder_kv_shape).permute((2, 0, 3, 1, 4))
-        encoder_k, encoder_v = encoder_kv.unbind(0)
+        if cached_kv is not None and "audio" in cached_kv:
+            encoder_k, encoder_v = cached_kv["audio"]
+        else:
+            _, N_a, _ = encoder_hidden_states.shape
+            encoder_kv = self.kv_linear(encoder_hidden_states)
+            encoder_kv_shape = (B, N_a, 2, self.num_heads, self.head_dim)
+            encoder_kv = encoder_kv.view(encoder_kv_shape).permute((2, 0, 3, 1, 4))
+            encoder_k, encoder_v = encoder_kv.unbind(0)
 
         if self.qk_norm:
             encoder_k = self.add_k_norm(encoder_k)
@@ -98,6 +102,18 @@ class SingleStreamAttention(nn.Module):
             x = rearrange(x, "(B N_t) S C -> B (N_t S) C", N_t=N_t)
         # x = torch.concat([x, x_a], dim=1)
         return x
+
+    def compute_kv(self, encoder_hidden_states: torch.Tensor):
+        _, N_a, _ = encoder_hidden_states.shape
+        encoder_kv = self.kv_linear(encoder_hidden_states)
+        encoder_kv_shape = (encoder_hidden_states.shape[0], N_a, 2, self.num_heads, self.head_dim)
+        encoder_kv = encoder_kv.view(encoder_kv_shape).permute((2, 0, 3, 1, 4))
+        encoder_k, encoder_v = encoder_kv.unbind(0)
+
+        if self.qk_norm:
+            encoder_k = self.add_k_norm(encoder_k)
+
+        return {"audio": (encoder_k, encoder_v)}
 
 
 class SingleStreamMutiAttention(SingleStreamAttention):
@@ -141,11 +157,12 @@ class SingleStreamMutiAttention(SingleStreamAttention):
         shape=None,
         x_ref_attn_map=None,
         human_num=None,
+        cached_kv=None,
     ) -> torch.Tensor:
 
         encoder_hidden_states = encoder_hidden_states.squeeze(0)
         if human_num == 1:
-            return super().forward(x, encoder_hidden_states, shape)
+            return super().forward(x, encoder_hidden_states, shape, cached_kv=cached_kv)
 
         N_t, _, _ = shape
         x = rearrange(x, "B (N_t S) C -> (B N_t) S C", N_t=N_t)
@@ -193,11 +210,14 @@ class SingleStreamMutiAttention(SingleStreamAttention):
         q = self.rope_1d(q, normalized_pos)
         q = rearrange(q, "B H (N_t S) C -> (B N_t) H S C", N_t=N_t)
 
-        _, N_a, _ = encoder_hidden_states.shape
-        encoder_kv = self.kv_linear(encoder_hidden_states)
-        encoder_kv_shape = (B, N_a, 2, self.num_heads, self.head_dim)
-        encoder_kv = encoder_kv.view(encoder_kv_shape).permute((2, 0, 3, 1, 4))
-        encoder_k, encoder_v = encoder_kv.unbind(0)
+        if cached_kv is not None and "audio" in cached_kv:
+            encoder_k, encoder_v = cached_kv["audio"]
+        else:
+            _, N_a, _ = encoder_hidden_states.shape
+            encoder_kv = self.kv_linear(encoder_hidden_states)
+            encoder_kv_shape = (B, N_a, 2, self.num_heads, self.head_dim)
+            encoder_kv = encoder_kv.view(encoder_kv_shape).permute((2, 0, 3, 1, 4))
+            encoder_k, encoder_v = encoder_kv.unbind(0)
 
         if self.qk_norm:
             encoder_k = self.add_k_norm(encoder_k)
@@ -227,3 +247,7 @@ class SingleStreamMutiAttention(SingleStreamAttention):
         x = rearrange(x, "(B N_t) S C -> B (N_t S) C", N_t=N_t)
 
         return x
+
+    def compute_kv(self, encoder_hidden_states: torch.Tensor):
+        encoder_hidden_states = encoder_hidden_states.squeeze(0)
+        return super().compute_kv(encoder_hidden_states)

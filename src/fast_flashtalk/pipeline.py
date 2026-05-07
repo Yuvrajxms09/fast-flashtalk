@@ -449,6 +449,16 @@ class FlashTalkPipeline:
                 }
             )
 
+            self.onload_dit_model()
+            condition_cache = self.model.compute_kv_cache(
+                context=self.arg_c["context"],
+                clip_fea=self.arg_c["clip_fea"],
+                audio=self.arg_c["audio"],
+                ref_target_masks=self.arg_c["ref_target_masks"],
+                dtype=self.param_dtype,
+                device=self.device,
+            )
+
             # sample videos
             latent = torch.randn(
                 16,
@@ -472,7 +482,10 @@ class FlashTalkPipeline:
                 # inference without CFG
                 start_time = time.perf_counter()
                 noise_pred_cond = self.model(
-                    latent_model_input, t=timestep, **self.arg_c
+                    latent_model_input,
+                    t=timestep,
+                    condition_cache=condition_cache,
+                    **self.arg_c,
                 )[0]
                 torch.cuda.synchronize()
                 end_time = time.perf_counter()

@@ -110,17 +110,24 @@ class WanI2VCrossAttention(WanSelfAttention):
         self.v_img = nn.Linear(dim, dim)
         self.norm_k_img = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-    def forward(self, x, context, context_lens):
-        context_img = context[:, :257]
-        context = context[:, 257:]
+    def forward(self, x, context, context_lens, cached_kv=None, context_image_len=None):
+        image_len = 257 if context_image_len is None else context_image_len
+        context_img = context[:, :image_len]
+        context = context[:, image_len:]
         b, n, d = x.size(0), self.num_heads, self.head_dim
 
         # compute query, key, value
         q = self.norm_q(self.q(x)).view(b, -1, n, d)
-        k = self.norm_k(self.k(context)).view(b, -1, n, d)
-        v = self.v(context).view(b, -1, n, d)
-        k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
-        v_img = self.v_img(context_img).view(b, -1, n, d)
+        if cached_kv is not None and "text" in cached_kv:
+            k, v = cached_kv["text"]
+        else:
+            k = self.norm_k(self.k(context)).view(b, -1, n, d)
+            v = self.v(context).view(b, -1, n, d)
+        if cached_kv is not None and "image" in cached_kv:
+            k_img, v_img = cached_kv["image"]
+        else:
+            k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
+            v_img = self.v_img(context_img).view(b, -1, n, d)
         img_x = attention(q, k_img, v_img)
         # compute attention
         x = attention(q, k, v)
@@ -131,6 +138,18 @@ class WanI2VCrossAttention(WanSelfAttention):
         x = x + img_x
         x = self.o(x)
         return x
+
+    def compute_kv(self, context, context_image_len=None):
+        image_len = 257 if context_image_len is None else context_image_len
+        context_img = context[:, :image_len]
+        context = context[:, image_len:]
+
+        b, n, d = context.size(0), self.num_heads, self.head_dim
+        k = self.norm_k(self.k(context)).view(b, -1, n, d)
+        v = self.v(context).view(b, -1, n, d)
+        k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
+        v_img = self.v_img(context_img).view(b, -1, n, d)
+        return {"text": (k, v), "image": (k_img, v_img)}
 
 
 class WanAttentionBlock(nn.Module):
@@ -207,6 +226,8 @@ class WanAttentionBlock(nn.Module):
         audio_embedding=None,
         ref_target_masks=None,
         human_num=None,
+        cached_kv=None,
+        context_image_len=None,
     ):
 
         dtype = x.dtype
@@ -229,7 +250,13 @@ class WanAttentionBlock(nn.Module):
         x = x.to(dtype)
 
         # cross-attention of text
-        x = x + self.cross_attn(self.norm3(x), context, context_lens)
+        x = x + self.cross_attn(
+            self.norm3(x),
+            context,
+            context_lens,
+            cached_kv=cached_kv,
+            context_image_len=context_image_len,
+        )
 
         # cross attn of audio
         x_a = self.audio_cross_attn(
@@ -238,6 +265,7 @@ class WanAttentionBlock(nn.Module):
             shape=grid_sizes[0],
             x_ref_attn_map=x_ref_attn_map,
             human_num=human_num,
+            cached_kv=cached_kv,
         )
         x = x + x_a
 
@@ -248,6 +276,12 @@ class WanAttentionBlock(nn.Module):
         x = x.to(dtype)
 
         return x
+
+    def compute_kv(self, context, audio_embedding, context_image_len=None):
+        cached_kv = {}
+        cached_kv.update(self.cross_attn.compute_kv(context, context_image_len=context_image_len))
+        cached_kv.update(self.audio_cross_attn.compute_kv(audio_embedding))
+        return cached_kv
 
 
 class Head(nn.Module):
@@ -506,6 +540,7 @@ class WanModel(ModelMixin, ConfigMixin):
         y=None,
         audio=None,
         ref_target_masks=None,
+        condition_cache=None,
     ):
         assert clip_fea is not None and y is not None
 
@@ -548,65 +583,22 @@ class WanModel(ModelMixin, ConfigMixin):
             e0 = self.time_projection(e).unflatten(1, (6, self.dim))
             assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
-        # text embedding
         context_lens = None
-        context = self.text_embedding(
-            torch.stack(
-                [
-                    torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
-                    for u in context
-                ]
+        if condition_cache is None:
+            condition_cache = self.compute_kv_cache(
+                context=context,
+                clip_fea=clip_fea,
+                audio=audio,
+                ref_target_masks=ref_target_masks,
+                dtype=x.dtype,
+                device=x.device,
             )
-        )
 
-        # clip embedding
-        if clip_fea is not None:
-            context_clip = self.img_emb(clip_fea)
-            context = torch.concat([context_clip, context], dim=1).to(x.dtype)
-
-        audio_cond = audio.to(device=x.device, dtype=x.dtype)
-        first_frame_audio_emb_s = audio_cond[:, :1, ...]  # b 1 w s c
-        latter_frame_audio_emb = audio_cond[:, 1:, ...]
-        latter_frame_audio_emb = rearrange(
-            latter_frame_audio_emb, "b (n_t n) w s c -> b n_t n w s c", n=self.vae_scale
-        )
-        middle_index = self.audio_window // 2
-        latter_first_frame_audio_emb = latter_frame_audio_emb[
-            :, :, :1, : middle_index + 1, ...
-        ]
-        latter_first_frame_audio_emb = rearrange(
-            latter_first_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c"
-        )  # b n_t (1 3) s c
-        latter_last_frame_audio_emb = latter_frame_audio_emb[
-            :, :, -1:, middle_index:, ...
-        ]
-        latter_last_frame_audio_emb = rearrange(
-            latter_last_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c"
-        )  # b n_t (1 3) s c
-        latter_middle_frame_audio_emb = latter_frame_audio_emb[
-            :, :, 1:-1, middle_index : middle_index + 1, ...
-        ]
-        latter_middle_frame_audio_emb = rearrange(
-            latter_middle_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c"
-        )  # b n_t (2 1) s c
-
-        latter_frame_audio_emb_s = torch.concat(
-            [
-                latter_first_frame_audio_emb,
-                latter_middle_frame_audio_emb,
-                latter_last_frame_audio_emb,
-            ],
-            dim=2,
-        )
-        audio_embedding = self.audio_proj(
-            first_frame_audio_emb_s, latter_frame_audio_emb_s
-        )
-        human_num = len(audio_embedding)
-        # if False:
-        #     audio_embedding = torch.concat(audio_embedding.split(1), dim=2).to(x.dtype)
-        # else:
-        #     audio_embedding = audio_embedding.to(x.dtype)
-        audio_embedding = torch.concat(audio_embedding.split(1), dim=2).to(x.dtype)
+        context = condition_cache["context"]
+        audio_embedding = condition_cache["audio_embedding"]
+        human_num = condition_cache["human_num"]
+        block_kv_cache = condition_cache["block_kv"]
+        context_image_len = condition_cache["context_image_len"]
 
         # convert ref_target_masks to token_ref_target_masks
         if ref_target_masks is not None:
@@ -634,9 +626,14 @@ class WanModel(ModelMixin, ConfigMixin):
             audio_embedding=audio_embedding,
             ref_target_masks=token_ref_target_masks,
             human_num=human_num,
+            context_image_len=context_image_len,
         )
-        for block in self.blocks:
-            x = block(x, **kwargs)
+        for i, block in enumerate(self.blocks):
+            x = block(
+                x,
+                **kwargs,
+                cached_kv=block_kv_cache[i] if block_kv_cache is not None else None,
+            )
 
         # head
         x = self.head(x, e)
@@ -645,6 +642,85 @@ class WanModel(ModelMixin, ConfigMixin):
         x = self.unpatchify(x, grid_sizes)
 
         return torch.stack(x).float()
+
+    @torch.no_grad()
+    def compute_kv_cache(
+        self,
+        context,
+        clip_fea=None,
+        audio=None,
+        ref_target_masks=None,
+        dtype=None,
+        device=None,
+    ):
+        if dtype is None:
+            dtype = self.patch_embedding.weight.dtype
+        if device is None:
+            device = self.patch_embedding.weight.device
+
+        context = self.text_embedding(
+            torch.stack(
+                [
+                    torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
+                    for u in context
+                ]
+            )
+        )
+
+        if clip_fea is not None:
+            context_clip = self.img_emb(clip_fea)
+            context = torch.concat([context_clip, context], dim=1).to(dtype)
+            context_image_len = context_clip.shape[1]
+        else:
+            context = context.to(dtype)
+            context_image_len = 0
+
+        audio_cond = audio.to(device=device, dtype=dtype)
+        first_frame_audio_emb_s = audio_cond[:, :1, ...]
+        latter_frame_audio_emb = audio_cond[:, 1:, ...]
+        latter_frame_audio_emb = rearrange(
+            latter_frame_audio_emb, "b (n_t n) w s c -> b n_t n w s c", n=self.vae_scale
+        )
+        middle_index = self.audio_window // 2
+        latter_first_frame_audio_emb = latter_frame_audio_emb[:, :, :1, : middle_index + 1, ...]
+        latter_first_frame_audio_emb = rearrange(
+            latter_first_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c"
+        )
+        latter_last_frame_audio_emb = latter_frame_audio_emb[:, :, -1:, middle_index:, ...]
+        latter_last_frame_audio_emb = rearrange(
+            latter_last_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c"
+        )
+        latter_middle_frame_audio_emb = latter_frame_audio_emb[
+            :, :, 1:-1, middle_index : middle_index + 1, ...
+        ]
+        latter_middle_frame_audio_emb = rearrange(
+            latter_middle_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c"
+        )
+
+        latter_frame_audio_emb_s = torch.concat(
+            [
+                latter_first_frame_audio_emb,
+                latter_middle_frame_audio_emb,
+                latter_last_frame_audio_emb,
+            ],
+            dim=2,
+        )
+        audio_embedding = self.audio_proj(first_frame_audio_emb_s, latter_frame_audio_emb_s)
+        human_num = len(audio_embedding)
+        audio_embedding = torch.concat(audio_embedding.split(1), dim=2).to(dtype)
+
+        block_kv_cache = [
+            block.compute_kv(context, audio_embedding, context_image_len=context_image_len)
+            for block in self.blocks
+        ]
+
+        return {
+            "context": context,
+            "audio_embedding": audio_embedding,
+            "human_num": human_num,
+            "block_kv": block_kv_cache,
+            "context_image_len": context_image_len,
+        }
 
     def unpatchify(self, x, grid_sizes):
         r"""
