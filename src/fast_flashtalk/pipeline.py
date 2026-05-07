@@ -450,14 +450,31 @@ class FlashTalkPipeline:
             )
 
             self.onload_dit_model()
-            condition_cache = self.model.compute_kv_cache(
-                context=self.arg_c["context"],
-                clip_fea=self.arg_c["clip_fea"],
-                audio=self.arg_c["audio"],
-                ref_target_masks=self.arg_c["ref_target_masks"],
-                dtype=self.param_dtype,
-                device=self.device,
+            logger.info(
+                "KV cache build start: chunk_audio_shape={}, clip_fea_shape={}, context_count={}",
+                tuple(self.arg_c["audio"].shape) if self.arg_c.get("audio") is not None else None,
+                tuple(self.arg_c["clip_fea"].shape) if self.arg_c.get("clip_fea") is not None else None,
+                len(self.arg_c["context"]) if self.arg_c.get("context") is not None else 0,
             )
+            try:
+                condition_cache = self.model.compute_kv_cache(
+                    context=self.arg_c["context"],
+                    clip_fea=self.arg_c["clip_fea"],
+                    audio=self.arg_c["audio"],
+                    ref_target_masks=self.arg_c["ref_target_masks"],
+                    dtype=self.param_dtype,
+                    device=self.device,
+                )
+                logger.info(
+                    "KV cache build success: block_count={}, context_image_len={}",
+                    len(condition_cache.get("block_kv", [])),
+                    condition_cache.get("context_image_len"),
+                )
+            except Exception:
+                logger.exception(
+                    "KV cache build failed; falling back to uncached recomputation inside WanModel.forward()."
+                )
+                condition_cache = None
 
             # sample videos
             latent = torch.randn(
@@ -487,6 +504,13 @@ class FlashTalkPipeline:
                     condition_cache=condition_cache,
                     **self.arg_c,
                 )[0]
+                logger.debug(
+                    "KV cache step {} completed: cache_enabled={}, latent_dtype={}, output_dtype={}",
+                    i,
+                    condition_cache is not None,
+                    latent.dtype,
+                    noise_pred_cond.dtype,
+                )
                 torch.cuda.synchronize()
                 end_time = time.perf_counter()
                 logger.info(f"model denoise per step: {end_time - start_time:.2f}s")

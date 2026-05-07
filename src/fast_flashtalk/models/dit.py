@@ -3,6 +3,7 @@ import torch
 from torch import amp
 import torch.nn as nn
 import torch.nn.functional as F
+from loguru import logger
 
 from einops import rearrange
 from diffusers import ModelMixin
@@ -543,6 +544,17 @@ class WanModel(ModelMixin, ConfigMixin):
         condition_cache=None,
     ):
         assert clip_fea is not None and y is not None
+        if condition_cache is None:
+            logger.warning(
+                "KV cache missing in WanModel.forward(); recomputing conditioning cache inside the model."
+            )
+        else:
+            logger.info(
+                "KV cache hit in WanModel.forward(); keys={}, block_count={}, context_image_len={}",
+                list(condition_cache.keys()),
+                len(condition_cache.get("block_kv", [])),
+                condition_cache.get("context_image_len"),
+            )
 
         # params
         # device = self.patch_embedding.weight.device
@@ -585,6 +597,7 @@ class WanModel(ModelMixin, ConfigMixin):
 
         context_lens = None
         if condition_cache is None:
+            logger.info("Building conditioning KV cache inside WanModel.forward().")
             condition_cache = self.compute_kv_cache(
                 context=context,
                 clip_fea=clip_fea,
@@ -599,6 +612,12 @@ class WanModel(ModelMixin, ConfigMixin):
         human_num = condition_cache["human_num"]
         block_kv_cache = condition_cache["block_kv"]
         context_image_len = condition_cache["context_image_len"]
+        logger.debug(
+            "WanModel.forward using cached conditioning: context_shape={}, audio_shape={}, block_kv_blocks={}",
+            tuple(context.shape),
+            tuple(audio_embedding.shape),
+            len(block_kv_cache),
+        )
 
         # convert ref_target_masks to token_ref_target_masks
         if ref_target_masks is not None:
@@ -657,6 +676,14 @@ class WanModel(ModelMixin, ConfigMixin):
             dtype = self.patch_embedding.weight.dtype
         if device is None:
             device = self.patch_embedding.weight.device
+        logger.info(
+            "compute_kv_cache start: text_prompts={}, clip_fea_present={}, audio_present={}, dtype={}, device={}",
+            len(context) if context is not None else 0,
+            clip_fea is not None,
+            audio is not None,
+            dtype,
+            device,
+        )
 
         context = self.text_embedding(
             torch.stack(
@@ -713,6 +740,13 @@ class WanModel(ModelMixin, ConfigMixin):
             block.compute_kv(context, audio_embedding, context_image_len=context_image_len)
             for block in self.blocks
         ]
+        logger.info(
+            "compute_kv_cache done: context_shape={}, audio_shape={}, context_image_len={}, block_count={}",
+            tuple(context.shape),
+            tuple(audio_embedding.shape),
+            context_image_len,
+            len(block_kv_cache),
+        )
 
         return {
             "context": context,
