@@ -139,6 +139,7 @@ class FlashTalkPipeline:
         self.context_stride = 4
         self.context_overlap = 16
         self.context_fuse_method = "linear"
+        self.last_generation_debug = None
 
         self.vae = WanVAE(
             vae_path=os.path.join(checkpoint_dir, config.vae_checkpoint),
@@ -699,6 +700,103 @@ class FlashTalkPipeline:
 
     def _update_window_memory_anchor(self, phase_idx: int) -> None:
         self.window_anchor_cache[phase_idx] = self.latent_motion_frames.detach().clone()
+
+    def _new_generation_debug(
+        self,
+        *,
+        input_prompt: str,
+        audio_encode_mode: str,
+        frame_num: int,
+        motion_frames_num: int,
+        slice_len: int,
+        sample_rate: int,
+        tgt_fps: int,
+    ) -> dict:
+        return {
+            "input_prompt": input_prompt,
+            "audio_encode_mode": audio_encode_mode,
+            "frame_num": int(frame_num),
+            "motion_frames_num": int(motion_frames_num),
+            "slice_len": int(slice_len),
+            "sample_rate": int(sample_rate),
+            "tgt_fps": int(tgt_fps),
+            "chunks": [],
+            "summary": {},
+        }
+
+    def _append_generation_debug_chunk(
+        self,
+        debug_state: dict,
+        *,
+        chunk_idx: int,
+        chunk_count: int,
+        source_start_frame: int,
+        source_end_frame: int,
+        stitched_start_frame: int,
+        stitched_end_frame: int,
+        raw_chunk_frames: int,
+        output_chunk_frames: int,
+        seam_start_frame: int | None,
+        seam_end_frame: int | None,
+        drift_score: float,
+        reanchored_this_chunk: bool,
+        window_memory_used: bool,
+        window_phase_idx: int | None,
+        temporal_crossfade_frames: int,
+        blend_frames_used: int,
+        postprocess_seam_repair_frames: int,
+        postprocess_temporal_smoothing_frames: int,
+        postprocess_boundary_alignment: bool,
+    ) -> None:
+        debug_state["chunks"].append(
+            {
+                "chunk_idx": int(chunk_idx),
+                "chunk_count": int(chunk_count),
+                "source_start_frame": int(source_start_frame),
+                "source_end_frame": int(source_end_frame),
+                "stitched_start_frame": int(stitched_start_frame),
+                "stitched_end_frame": int(stitched_end_frame),
+                "raw_chunk_frames": int(raw_chunk_frames),
+                "output_chunk_frames": int(output_chunk_frames),
+                "seam_start_frame": None if seam_start_frame is None else int(seam_start_frame),
+                "seam_end_frame": None if seam_end_frame is None else int(seam_end_frame),
+                "drift_score": float(drift_score),
+                "reanchored_this_chunk": bool(reanchored_this_chunk),
+                "window_memory_used": bool(window_memory_used),
+                "window_phase_idx": None if window_phase_idx is None else int(window_phase_idx),
+                "temporal_crossfade_frames": int(temporal_crossfade_frames),
+                "temporal_crossfade_frames_used": int(blend_frames_used),
+                "postprocess_seam_repair_frames": int(postprocess_seam_repair_frames),
+                "postprocess_temporal_smoothing_frames": int(postprocess_temporal_smoothing_frames),
+                "postprocess_boundary_alignment": bool(postprocess_boundary_alignment),
+            }
+        )
+
+    def _finalize_generation_debug(self, debug_state: dict) -> dict:
+        chunks = debug_state.get("chunks", [])
+        if not chunks:
+            debug_state["summary"] = {
+                "chunk_count": 0,
+                "mean_boundary_drift": 0.0,
+                "max_boundary_drift": 0.0,
+                "reanchor_count": 0,
+                "window_memory_hit_count": 0,
+                "crossfade_count": 0,
+                "total_output_frames": 0,
+            }
+            return debug_state
+
+        boundary_drifts = [chunk["drift_score"] for chunk in chunks[1:]]
+        debug_state["summary"] = {
+            "chunk_count": len(chunks),
+            "mean_boundary_drift": float(np.mean(boundary_drifts)) if boundary_drifts else 0.0,
+            "max_boundary_drift": float(np.max(boundary_drifts)) if boundary_drifts else 0.0,
+            "reanchor_count": int(sum(1 for chunk in chunks if chunk["reanchored_this_chunk"])),
+            "window_memory_hit_count": int(sum(1 for chunk in chunks if chunk["window_memory_used"])),
+            "crossfade_count": int(sum(1 for chunk in chunks if chunk["temporal_crossfade_frames_used"] > 0)),
+            "total_output_frames": int(chunks[-1]["stitched_end_frame"] + 1),
+        }
+        return debug_state
         logger.info(
             "Cached window memory anchor for phase {} with {} latent step(s).",
             phase_idx,
@@ -1208,6 +1306,15 @@ class FlashTalkPipeline:
         ).data
         human_speech_array_slice_len = slice_len * sample_rate // tgt_fps
         human_speech_array_frame_num = frame_num * sample_rate // tgt_fps
+        generation_debug = self._new_generation_debug(
+            input_prompt=input_prompt,
+            audio_encode_mode=audio_encode_mode,
+            frame_num=frame_num,
+            motion_frames_num=motion_frames_num,
+            slice_len=slice_len,
+            sample_rate=sample_rate,
+            tgt_fps=tgt_fps,
+        )
         data_prepare_time = time.perf_counter()
         logger.info(
             f"Data preparation time: {data_prepare_time - generate_start_time:.2f}s"
@@ -1216,6 +1323,7 @@ class FlashTalkPipeline:
         generated_list = []
         previous_stitched_tail = None
         force_reanchor_next_chunk = False
+        stitched_frame_cursor = 0
         if audio_encode_mode == "once":
             # pad audio with silence to avoid truncating the last chunk
             remainder = (
@@ -1246,6 +1354,10 @@ class FlashTalkPipeline:
             for chunk_idx, audio_embedding_chunk in enumerate(
                 audio_embedding_chunks_list
             ):
+                source_start_frame = chunk_idx * slice_len
+                source_end_frame = source_start_frame + frame_num - 1
+                chunk_window_memory_used = False
+                window_phase_idx = None
                 reanchored_this_chunk = False
                 if chunk_idx > 0:
                     should_periodic_reanchor = (
@@ -1270,9 +1382,11 @@ class FlashTalkPipeline:
                         phase_idx = self._get_context_phase_index(
                             chunk_idx, chunk_count
                         )
+                        window_phase_idx = phase_idx
                         if self._apply_window_memory_anchor(
                             phase_idx, window_memory_strength
                         ):
+                            chunk_window_memory_used = True
                             logger.info(
                                 "Chunk-{} reused window memory phase {} before generation.",
                                 chunk_idx,
@@ -1329,9 +1443,8 @@ class FlashTalkPipeline:
                     previous_stitched_tail = video[-motion_frames_num:].clone()
 
                 if window_memory_period > 0 and window_memory_strength > 0.0:
-                    phase_idx = self._get_context_phase_index(
-                        chunk_idx, chunk_count
-                    )
+                    phase_idx = self._get_context_phase_index(chunk_idx, chunk_count)
+                    window_phase_idx = phase_idx if window_phase_idx is None else window_phase_idx
                     if chunk_idx > 0 and adaptive_drift_refresh and drift_score >= drift_refresh_threshold:
                         logger.info(
                             "Skipping window memory cache update for phase {} due to elevated drift score {:.4f}.",
@@ -1340,6 +1453,49 @@ class FlashTalkPipeline:
                         )
                     else:
                         self._update_window_memory_anchor(phase_idx)
+
+                stitched_start_frame = stitched_frame_cursor
+                stitched_end_frame = stitched_start_frame + int(video.shape[0]) - 1
+                seam_start_frame = None if chunk_idx == 0 else stitched_start_frame
+                seam_end_frame = None if chunk_idx == 0 else stitched_start_frame + motion_frames_num - 1
+                self._append_generation_debug_chunk(
+                    generation_debug,
+                    chunk_idx=chunk_idx,
+                    chunk_count=chunk_count,
+                    source_start_frame=source_start_frame,
+                    source_end_frame=source_end_frame,
+                    stitched_start_frame=stitched_start_frame,
+                    stitched_end_frame=stitched_end_frame,
+                    raw_chunk_frames=int(audio_embedding_chunk.shape[1]),
+                    output_chunk_frames=int(video.shape[0]),
+                    seam_start_frame=seam_start_frame,
+                    seam_end_frame=seam_end_frame,
+                    drift_score=drift_score,
+                    reanchored_this_chunk=reanchored_this_chunk,
+                    window_memory_used=chunk_window_memory_used,
+                    window_phase_idx=window_phase_idx,
+                    temporal_crossfade_frames=temporal_crossfade_frames,
+                    blend_frames_used=min(temporal_crossfade_frames, motion_frames_num) if chunk_idx > 0 and temporal_crossfade_frames > 0 else 0,
+                    postprocess_seam_repair_frames=postprocess_seam_repair_frames,
+                    postprocess_temporal_smoothing_frames=postprocess_temporal_smoothing_frames,
+                    postprocess_boundary_alignment=postprocess_boundary_alignment,
+                )
+                logger.info(
+                    "Chunk-{} exact stitch range: source_frames=[{}..{}], stitched_frames=[{}..{}], seam_frames=[{}..{}], output_frames={}, drift_score={:.4f}, latent_carryover_steps={}, window_memory_used={}, reanchored={}.",
+                    chunk_idx,
+                    source_start_frame,
+                    source_end_frame,
+                    stitched_start_frame,
+                    stitched_end_frame,
+                    seam_start_frame if seam_start_frame is not None else -1,
+                    seam_end_frame if seam_end_frame is not None else -1,
+                    int(video.shape[0]),
+                    drift_score,
+                    int(latent_carryover_steps),
+                    chunk_window_memory_used,
+                    reanchored_this_chunk,
+                )
+                stitched_frame_cursor += int(video.shape[0])
 
                 torch.cuda.synchronize()
                 end_time = time.time()
@@ -1377,6 +1533,10 @@ class FlashTalkPipeline:
             total_chunks = human_speech_array_slices.shape[0]
 
             for chunk_idx, human_speech_array in enumerate(human_speech_array_slices):
+                source_start_frame = chunk_idx * slice_len
+                source_end_frame = source_start_frame + frame_num - 1
+                chunk_window_memory_used = False
+                window_phase_idx = None
                 reanchored_this_chunk = False
                 if chunk_idx > 0:
                     should_periodic_reanchor = (
@@ -1401,9 +1561,11 @@ class FlashTalkPipeline:
                         phase_idx = self._get_context_phase_index(
                             chunk_idx, total_chunks
                         )
+                        window_phase_idx = phase_idx
                         if self._apply_window_memory_anchor(
                             phase_idx, window_memory_strength
                         ):
+                            chunk_window_memory_used = True
                             logger.info(
                                 "Chunk-{} reused window memory phase {} before generation.",
                                 chunk_idx,
@@ -1467,9 +1629,8 @@ class FlashTalkPipeline:
                     previous_stitched_tail = video[-motion_frames_num:].clone()
 
                 if window_memory_period > 0 and window_memory_strength > 0.0:
-                    phase_idx = self._get_context_phase_index(
-                        chunk_idx, total_chunks
-                    )
+                    phase_idx = self._get_context_phase_index(chunk_idx, total_chunks)
+                    window_phase_idx = phase_idx if window_phase_idx is None else window_phase_idx
                     if chunk_idx > 0 and adaptive_drift_refresh and drift_score >= drift_refresh_threshold:
                         logger.info(
                             "Skipping window memory cache update for phase {} due to elevated drift score {:.4f}.",
@@ -1478,6 +1639,49 @@ class FlashTalkPipeline:
                         )
                     else:
                         self._update_window_memory_anchor(phase_idx)
+
+                stitched_start_frame = stitched_frame_cursor
+                stitched_end_frame = stitched_start_frame + int(video.shape[0]) - 1
+                seam_start_frame = None if chunk_idx == 0 else stitched_start_frame
+                seam_end_frame = None if chunk_idx == 0 else stitched_start_frame + motion_frames_num - 1
+                self._append_generation_debug_chunk(
+                    generation_debug,
+                    chunk_idx=chunk_idx,
+                    chunk_count=total_chunks,
+                    source_start_frame=source_start_frame,
+                    source_end_frame=source_end_frame,
+                    stitched_start_frame=stitched_start_frame,
+                    stitched_end_frame=stitched_end_frame,
+                    raw_chunk_frames=int(video.shape[0] + (motion_frames_num if chunk_idx > 0 else 0)),
+                    output_chunk_frames=int(video.shape[0]),
+                    seam_start_frame=seam_start_frame,
+                    seam_end_frame=seam_end_frame,
+                    drift_score=drift_score,
+                    reanchored_this_chunk=reanchored_this_chunk,
+                    window_memory_used=chunk_window_memory_used,
+                    window_phase_idx=window_phase_idx,
+                    temporal_crossfade_frames=temporal_crossfade_frames,
+                    blend_frames_used=min(temporal_crossfade_frames, motion_frames_num) if chunk_idx > 0 and temporal_crossfade_frames > 0 else 0,
+                    postprocess_seam_repair_frames=postprocess_seam_repair_frames,
+                    postprocess_temporal_smoothing_frames=postprocess_temporal_smoothing_frames,
+                    postprocess_boundary_alignment=postprocess_boundary_alignment,
+                )
+                logger.info(
+                    "Chunk-{} exact stitch range: source_frames=[{}..{}], stitched_frames=[{}..{}], seam_frames=[{}..{}], output_frames={}, drift_score={:.4f}, latent_carryover_steps={}, window_memory_used={}, reanchored={}.",
+                    chunk_idx,
+                    source_start_frame,
+                    source_end_frame,
+                    stitched_start_frame,
+                    stitched_end_frame,
+                    seam_start_frame if seam_start_frame is not None else -1,
+                    seam_end_frame if seam_end_frame is not None else -1,
+                    int(video.shape[0]),
+                    drift_score,
+                    int(latent_carryover_steps),
+                    chunk_window_memory_used,
+                    reanchored_this_chunk,
+                )
+                stitched_frame_cursor += int(video.shape[0])
 
                 torch.cuda.synchronize()
                 end_time = time.time()
@@ -1508,6 +1712,17 @@ class FlashTalkPipeline:
                 smoothing_frames=postprocess_temporal_smoothing_frames,
                 boundary_alignment=postprocess_boundary_alignment,
             )
+        self.last_generation_debug = self._finalize_generation_debug(generation_debug)
+        logger.info(
+            "Exact chunk boundary summary: chunk_count={}, mean_boundary_drift={:.4f}, max_boundary_drift={:.4f}, reanchors={}, window_memory_hits={}, crossfades={}, total_output_frames={}",
+            self.last_generation_debug["summary"]["chunk_count"],
+            self.last_generation_debug["summary"]["mean_boundary_drift"],
+            self.last_generation_debug["summary"]["max_boundary_drift"],
+            self.last_generation_debug["summary"]["reanchor_count"],
+            self.last_generation_debug["summary"]["window_memory_hit_count"],
+            self.last_generation_debug["summary"]["crossfade_count"],
+            self.last_generation_debug["summary"]["total_output_frames"],
+        )
         video_array = torch.cat(generated_list, dim=0).numpy().astype(np.uint8)
         video = Video(data=video_array, prompt=input_prompt, fps=tgt_fps)
         generate_end_time = time.perf_counter()
