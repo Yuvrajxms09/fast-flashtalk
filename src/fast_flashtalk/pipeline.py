@@ -129,7 +129,16 @@ class FlashTalkPipeline:
         self.patch_size = config.patch_size
         self.base_latent_motion_frames = None
         self.previous_chunk_latent_tail = None
+        self.window_anchor_cache = {}
         self.latent_carryover_steps = 0
+        self.decoded_anchor_frames = 0
+        self.window_memory_period = 0
+        self.window_memory_strength = 0.0
+        self.context_schedule = "uniform_standard"
+        self.context_frames = 81
+        self.context_stride = 4
+        self.context_overlap = 16
+        self.context_fuse_method = "linear"
 
         self.vae = WanVAE(
             vae_path=os.path.join(checkpoint_dir, config.vae_checkpoint),
@@ -388,6 +397,7 @@ class FlashTalkPipeline:
 
         self.latent_motion_frames = self.vae.encode(self.cond_image_tensor)
         self.base_latent_motion_frames = self.latent_motion_frames.clone()
+        self.window_anchor_cache = {}
 
         if self.cpu_offload:
             self.vae.model.cpu()
@@ -535,7 +545,9 @@ class FlashTalkPipeline:
                 videos, self.original_color_reference, self.color_correction_strength
             )
 
-        cond_frame = videos[:, :, -self.motion_frames_num :].to(self.device)
+        anchor_frames = max(int(self.motion_frames_num), int(self.decoded_anchor_frames))
+        anchor_frames = min(anchor_frames, int(videos.shape[2]))
+        cond_frame = videos[:, :, -anchor_frames:].to(self.device)
         torch.cuda.synchronize()
         end_color_correction_time = time.time()
         logger.info(
@@ -547,7 +559,12 @@ class FlashTalkPipeline:
         self.latent_motion_frames = self.vae.encode(cond_frame)
         torch.cuda.synchronize()
         end_encode_time = time.time()
-        logger.info(f"encode motion frames: {end_encode_time - start_encode_time:.2f}s")
+        logger.info(
+            "encode motion frames: {:.2f}s (anchor_frames={}, latent_steps={})",
+            end_encode_time - start_encode_time,
+            anchor_frames,
+            int(self.latent_motion_frames.shape[1]),
+        )
         self._update_latent_carryover_cache(latent)
 
         if self.cpu_offload:
@@ -618,6 +635,261 @@ class FlashTalkPipeline:
             int(self.latent_carryover_steps),
         )
 
+    def _apply_window_memory_anchor(
+        self,
+        phase_idx: int,
+        window_memory_strength: float,
+    ) -> bool:
+        if window_memory_strength <= 0.0:
+            return False
+
+        cached_anchor = self.window_anchor_cache.get(phase_idx)
+        if cached_anchor is None:
+            return False
+
+        if cached_anchor.shape != self.latent_motion_frames.shape:
+            logger.warning(
+                "Skipping window memory anchor for phase {} due to shape mismatch (cached={}, current={}).",
+                phase_idx,
+                tuple(cached_anchor.shape),
+                tuple(self.latent_motion_frames.shape),
+            )
+            return False
+
+        current_anchor = self.latent_motion_frames
+        cached_anchor = cached_anchor.to(current_anchor)
+
+        latent_steps = int(current_anchor.shape[1])
+        overlap_steps = min(
+            latent_steps,
+            max(1, int(round(self.context_overlap / 4.0))),
+        )
+        if self.context_fuse_method == "pyramid":
+            ramp = torch.arange(1, overlap_steps + 1, device=current_anchor.device, dtype=current_anchor.dtype)
+            if overlap_steps > 1:
+                weights = torch.cat([ramp, torch.flip(ramp[:-1], dims=[0])], dim=0)
+            else:
+                weights = ramp
+            weights = weights / weights.max().clamp_min(1e-8)
+            if weights.shape[0] < latent_steps:
+                pad = torch.zeros(latent_steps - weights.shape[0], device=current_anchor.device, dtype=current_anchor.dtype)
+                weights = torch.cat([weights, pad], dim=0)
+            elif weights.shape[0] > latent_steps:
+                weights = weights[:latent_steps]
+        else:
+            weights = torch.linspace(
+                0.0,
+                1.0,
+                steps=latent_steps,
+                device=current_anchor.device,
+                dtype=current_anchor.dtype,
+            )
+        weights = weights.view(1, latent_steps, 1, 1)
+
+        mix = float(window_memory_strength)
+        self.latent_motion_frames = current_anchor * (1 - weights * mix) + cached_anchor * (weights * mix)
+        logger.info(
+            "Applied window memory anchor for phase {} with mix {:.3f}, fuse_method={}, overlap_steps={}.",
+            phase_idx,
+            mix,
+            self.context_fuse_method,
+            overlap_steps,
+        )
+        return True
+
+    def _update_window_memory_anchor(self, phase_idx: int) -> None:
+        self.window_anchor_cache[phase_idx] = self.latent_motion_frames.detach().clone()
+        logger.info(
+            "Cached window memory anchor for phase {} with {} latent step(s).",
+            phase_idx,
+            int(self.latent_motion_frames.shape[1]),
+        )
+
+    def _get_context_phase_index(self, chunk_idx: int, total_chunks: int) -> int:
+        phase_count = max(1, math.ceil(self.context_frames / max(int(self.frame_num), 1)))
+        if self.context_schedule == "uniform_looped":
+            stride = max(1, int(round(self.context_stride / 4.0)))
+            return (chunk_idx * stride) % phase_count
+        if self.context_schedule == "uniform_standard":
+            return chunk_idx % phase_count
+        return min(chunk_idx, phase_count - 1)
+
+    @staticmethod
+    def _to_uint8_image(frame: torch.Tensor) -> np.ndarray:
+        image = frame.detach().cpu().numpy()
+        if image.dtype != np.uint8:
+            image = np.clip(np.rint(image), 0, 255).astype(np.uint8)
+        return image
+
+    @staticmethod
+    def _phase_correlation_shift(
+        reference_frame: np.ndarray, moving_frame: np.ndarray
+    ) -> tuple[int, int]:
+        reference_gray = reference_frame.astype(np.float32).mean(axis=-1)
+        moving_gray = moving_frame.astype(np.float32).mean(axis=-1)
+
+        reference_gray -= reference_gray.mean()
+        moving_gray -= moving_gray.mean()
+
+        reference_fft = np.fft.fft2(reference_gray)
+        moving_fft = np.fft.fft2(moving_gray)
+        cross_power = reference_fft * np.conj(moving_fft)
+        cross_power /= np.maximum(np.abs(cross_power), 1e-8)
+        correlation = np.fft.ifft2(cross_power)
+        peak_y, peak_x = np.unravel_index(np.argmax(np.abs(correlation)), correlation.shape)
+
+        if peak_y > reference_gray.shape[0] // 2:
+            peak_y -= reference_gray.shape[0]
+        if peak_x > reference_gray.shape[1] // 2:
+            peak_x -= reference_gray.shape[1]
+
+        return int(peak_x), int(peak_y)
+
+    @staticmethod
+    def _estimate_boundary_shift(
+        previous_tail: torch.Tensor,
+        current_head: torch.Tensor,
+    ) -> tuple[int, int, str]:
+        reference_frame = FlashTalkPipeline._to_uint8_image(previous_tail[-1])
+        moving_frame = FlashTalkPipeline._to_uint8_image(current_head[0])
+
+        try:
+            import cv2  # type: ignore
+
+            reference_gray = cv2.cvtColor(reference_frame, cv2.COLOR_RGB2GRAY)
+            moving_gray = cv2.cvtColor(moving_frame, cv2.COLOR_RGB2GRAY)
+            flow = cv2.calcOpticalFlowFarneback(
+                reference_gray,
+                moving_gray,
+                None,
+                pyr_scale=0.5,
+                levels=3,
+                winsize=15,
+                iterations=3,
+                poly_n=5,
+                poly_sigma=1.2,
+                flags=0,
+            )
+            shift_x = int(np.rint(np.median(flow[..., 0])))
+            shift_y = int(np.rint(np.median(flow[..., 1])))
+            return shift_x, shift_y, "optical_flow"
+        except Exception:
+            shift_x, shift_y = FlashTalkPipeline._phase_correlation_shift(
+                reference_frame, moving_frame
+            )
+            return shift_x, shift_y, "phase_correlation"
+
+    @staticmethod
+    def _translate_frames(frames: torch.Tensor, shift_x: int, shift_y: int) -> torch.Tensor:
+        if shift_x == 0 and shift_y == 0:
+            return frames
+        import torch.nn.functional as F
+
+        frames_bchw = frames.permute(0, 3, 1, 2).contiguous()
+        _, _, height, width = frames_bchw.shape
+        theta = torch.tensor(
+            [
+                [1.0, 0.0, -2.0 * float(shift_x) / max(width - 1, 1)],
+                [0.0, 1.0, -2.0 * float(shift_y) / max(height - 1, 1)],
+            ],
+            dtype=frames_bchw.dtype,
+            device=frames_bchw.device,
+        ).unsqueeze(0).repeat(frames_bchw.shape[0], 1, 1)
+        grid = F.affine_grid(theta, frames_bchw.shape, align_corners=False)
+        translated = F.grid_sample(
+            frames_bchw,
+            grid,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=False,
+        )
+        return translated.permute(0, 2, 3, 1).contiguous()
+
+    @staticmethod
+    def _temporal_smooth_frames(
+        frames: torch.Tensor,
+        smoothing_frames: int,
+    ) -> torch.Tensor:
+        smoothing_frames = int(smoothing_frames)
+        if smoothing_frames <= 0 or frames.shape[0] <= 1:
+            return frames
+
+        radius = min(smoothing_frames, frames.shape[0] - 1)
+        if radius <= 0:
+            return frames
+
+        weights = torch.arange(
+            1, radius + 2, device=frames.device, dtype=frames.dtype
+        )
+        if radius > 0:
+            weights = torch.cat([weights, torch.flip(weights[:-1], dims=[0])], dim=0)
+        weights = weights / weights.sum()
+
+        padded = torch.cat(
+            [frames[:1].repeat(radius, 1, 1, 1), frames, frames[-1:].repeat(radius, 1, 1, 1)],
+            dim=0,
+        )
+        smoothed_frames = []
+        for idx in range(frames.shape[0]):
+            window = padded[idx : idx + weights.shape[0]]
+            smoothed_frames.append((window * weights.view(-1, 1, 1, 1)).sum(dim=0))
+        return torch.stack(smoothed_frames, dim=0)
+
+    def _repair_chunk_seams(
+        self,
+        chunks: list[torch.Tensor],
+        seam_frames: int,
+        smoothing_frames: int,
+        boundary_alignment: bool,
+    ) -> list[torch.Tensor]:
+        if len(chunks) <= 1 or seam_frames <= 0:
+            return chunks
+
+        repaired: list[torch.Tensor] = [chunks[0].clone()]
+        for chunk_idx, next_chunk in enumerate(chunks[1:], start=1):
+            previous_chunk = repaired[-1]
+            repair_frames = min(
+                int(seam_frames),
+                int(previous_chunk.shape[0]),
+                int(next_chunk.shape[0]),
+            )
+            if repair_frames <= 0:
+                repaired.append(next_chunk.clone())
+                continue
+
+            previous_tail = previous_chunk[-repair_frames:].clone()
+            current_head = next_chunk[:repair_frames].clone()
+            alignment_method = "disabled"
+            shift_x = 0
+            shift_y = 0
+            if boundary_alignment:
+                shift_x, shift_y, alignment_method = self._estimate_boundary_shift(
+                    previous_tail, current_head
+                )
+                current_head = self._translate_frames(current_head, shift_x, shift_y)
+
+            blended_head = self._apply_temporal_crossfade(
+                previous_tail,
+                current_head,
+                repair_frames,
+            )
+            blended_head = self._temporal_smooth_frames(blended_head, smoothing_frames)
+
+            repaired[-1] = torch.cat([previous_chunk[:-repair_frames], blended_head], dim=0)
+            repaired.append(next_chunk[repair_frames:].clone())
+            logger.info(
+                "Post-process seam repair for chunk-{}: repair_frames={}, smoothing_frames={}, boundary_alignment={}, alignment_method={}, shift_x={}, shift_y={}.",
+                chunk_idx,
+                repair_frames,
+                smoothing_frames,
+                boundary_alignment,
+                alignment_method,
+                shift_x,
+                shift_y,
+            )
+
+        return repaired
+
     @staticmethod
     def _compute_boundary_drift_score(
         previous_tail: torch.Tensor | None,
@@ -681,6 +953,17 @@ class FlashTalkPipeline:
         adaptive_drift_refresh: bool | None = None,
         drift_refresh_threshold: float | None = None,
         latent_carryover_steps: int | None = None,
+        postprocess_seam_repair_frames: int | None = None,
+        postprocess_temporal_smoothing_frames: int | None = None,
+        postprocess_boundary_alignment: bool | None = None,
+        decoded_anchor_frames: int | None = None,
+        window_memory_period: int | None = None,
+        window_memory_strength: float | None = None,
+        context_schedule: str | None = None,
+        context_frames: int | None = None,
+        context_stride: int | None = None,
+        context_overlap: int | None = None,
+        context_fuse_method: Literal["linear", "pyramid"] | None = None,
     ) -> Video:
         """
         Generate video from the audio and image prompt.
@@ -706,6 +989,17 @@ class FlashTalkPipeline:
             adaptive_drift_refresh: Optional override to enable adaptive latent refresh when drift is high.
             drift_refresh_threshold: Optional override for the normalized drift score threshold.
             latent_carryover_steps: Optional override for how many latent time steps to carry from the prior chunk.
+            postprocess_seam_repair_frames: Optional override for seam repair overlap after generation.
+            postprocess_temporal_smoothing_frames: Optional override for temporal smoothing radius in seam repair.
+            postprocess_boundary_alignment: Optional override to enable boundary alignment before seam repair.
+            decoded_anchor_frames: Optional override for how many decoded frames anchor the next chunk latent.
+            window_memory_period: Optional override for the chunk-phase period used to reuse reference latents.
+            window_memory_strength: Optional override for how strongly the cached reference latent is blended in.
+            context_schedule: Optional InfiniteTalk-style schedule name for window memory policy.
+            context_frames: Optional InfiniteTalk-style context window size in pixel frames.
+            context_stride: Optional InfiniteTalk-style window stride in pixel frames.
+            context_overlap: Optional InfiniteTalk-style window overlap in pixel frames.
+            context_fuse_method: Optional InfiniteTalk-style window fuse method.
             video_save_path: Path to save the generated video.
             merge_video_audio: Whether to merge the generated video and the original audio.
             force_9_16: Whether to force the video to be 9:16.
@@ -773,6 +1067,61 @@ class FlashTalkPipeline:
             if latent_carryover_steps is None
             else latent_carryover_steps
         )
+        postprocess_seam_repair_frames = (
+            self.infer_params["postprocess_seam_repair_frames"]
+            if postprocess_seam_repair_frames is None
+            else postprocess_seam_repair_frames
+        )
+        postprocess_temporal_smoothing_frames = (
+            self.infer_params["postprocess_temporal_smoothing_frames"]
+            if postprocess_temporal_smoothing_frames is None
+            else postprocess_temporal_smoothing_frames
+        )
+        postprocess_boundary_alignment = (
+            self.infer_params["postprocess_boundary_alignment"]
+            if postprocess_boundary_alignment is None
+            else postprocess_boundary_alignment
+        )
+        decoded_anchor_frames = (
+            self.infer_params["decoded_anchor_frames"]
+            if decoded_anchor_frames is None
+            else decoded_anchor_frames
+        )
+        window_memory_period = (
+            self.infer_params["window_memory_period"]
+            if window_memory_period is None
+            else window_memory_period
+        )
+        window_memory_strength = (
+            self.infer_params["window_memory_strength"]
+            if window_memory_strength is None
+            else window_memory_strength
+        )
+        context_schedule = (
+            self.infer_params["context_schedule"]
+            if context_schedule is None
+            else context_schedule
+        )
+        context_frames = (
+            self.infer_params["context_frames"]
+            if context_frames is None
+            else context_frames
+        )
+        context_stride = (
+            self.infer_params["context_stride"]
+            if context_stride is None
+            else context_stride
+        )
+        context_overlap = (
+            self.infer_params["context_overlap"]
+            if context_overlap is None
+            else context_overlap
+        )
+        context_fuse_method = (
+            self.infer_params["context_fuse_method"]
+            if context_fuse_method is None
+            else context_fuse_method
+        )
 
         if temporal_crossfade_frames < 0:
             raise ValueError("temporal_crossfade_frames must be >= 0")
@@ -782,12 +1131,43 @@ class FlashTalkPipeline:
             raise ValueError("drift_refresh_threshold must be >= 0")
         if latent_carryover_steps < 0:
             raise ValueError("latent_carryover_steps must be >= 0")
+        if postprocess_seam_repair_frames < 0:
+            raise ValueError("postprocess_seam_repair_frames must be >= 0")
+        if postprocess_temporal_smoothing_frames < 0:
+            raise ValueError("postprocess_temporal_smoothing_frames must be >= 0")
+        if decoded_anchor_frames < 0:
+            raise ValueError("decoded_anchor_frames must be >= 0")
+        if window_memory_period < 0:
+            raise ValueError("window_memory_period must be >= 0")
+        if not 0.0 <= float(window_memory_strength) <= 1.0:
+            raise ValueError("window_memory_strength must be between 0 and 1")
+        if context_frames < 0:
+            raise ValueError("context_frames must be >= 0")
+        if context_stride < 0:
+            raise ValueError("context_stride must be >= 0")
+        if context_overlap < 0:
+            raise ValueError("context_overlap must be >= 0")
+        if postprocess_seam_repair_frames > 0 and postprocess_temporal_smoothing_frames == 0:
+            logger.info("Post-process seam repair enabled without temporal smoothing; set postprocess_temporal_smoothing_frames > 0 for seam denoising.")
+        if postprocess_boundary_alignment and postprocess_seam_repair_frames == 0:
+            logger.warning(
+                "postprocess_boundary_alignment is enabled but postprocess_seam_repair_frames is 0; alignment will not run without a seam repair window."
+            )
         if frame_num <= motion_frames_num:
             raise ValueError("frame_num must be greater than motion_frames_num")
 
         slice_len = frame_num - motion_frames_num
         self.latent_carryover_steps = latent_carryover_steps
+        self.decoded_anchor_frames = decoded_anchor_frames
+        self.window_memory_period = window_memory_period
+        self.window_memory_strength = float(window_memory_strength)
+        self.context_schedule = context_schedule
+        self.context_frames = int(context_frames)
+        self.context_stride = int(context_stride)
+        self.context_overlap = int(context_overlap)
+        self.context_fuse_method = context_fuse_method
         self.previous_chunk_latent_tail = None
+        self.window_anchor_cache = {}
         self.prepare_params(
             input_prompt=input_prompt,
             cond_image=image,
@@ -798,12 +1178,29 @@ class FlashTalkPipeline:
         )
 
         logger.info(
-            "Boundary controls: temporal_crossfade_frames={}, reanchor_every_n_chunks={}, adaptive_drift_refresh={}, drift_refresh_threshold={:.4f}, latent_carryover_steps={}",
+            "Boundary controls: temporal_crossfade_frames={}, reanchor_every_n_chunks={}, adaptive_drift_refresh={}, drift_refresh_threshold={:.4f}, latent_carryover_steps={}, postprocess_seam_repair_frames={}, postprocess_temporal_smoothing_frames={}, postprocess_boundary_alignment={}, decoded_anchor_frames={}",
             temporal_crossfade_frames,
             reanchor_every_n_chunks,
             adaptive_drift_refresh,
             drift_refresh_threshold,
             latent_carryover_steps,
+            postprocess_seam_repair_frames,
+            postprocess_temporal_smoothing_frames,
+            postprocess_boundary_alignment,
+            decoded_anchor_frames,
+        )
+        logger.info(
+            "Window memory: period={}, strength={:.3f}",
+            window_memory_period,
+            window_memory_strength,
+        )
+        logger.info(
+            "InfiniteTalk context defaults: schedule={}, context_frames={}, context_stride={}, context_overlap={}, fuse_method={}",
+            context_schedule,
+            context_frames,
+            context_stride,
+            context_overlap,
+            context_fuse_method,
         )
 
         human_speech_array_all = audio.load(
@@ -849,6 +1246,7 @@ class FlashTalkPipeline:
             for chunk_idx, audio_embedding_chunk in enumerate(
                 audio_embedding_chunks_list
             ):
+                reanchored_this_chunk = False
                 if chunk_idx > 0:
                     should_periodic_reanchor = (
                         reanchor_every_n_chunks > 0
@@ -862,6 +1260,24 @@ class FlashTalkPipeline:
                         )
                         self._restore_reference_motion_anchor(reason)
                         force_reanchor_next_chunk = False
+                        reanchored_this_chunk = True
+
+                    if (
+                        window_memory_period > 0
+                        and window_memory_strength > 0.0
+                        and not reanchored_this_chunk
+                    ):
+                        phase_idx = self._get_context_phase_index(
+                            chunk_idx, chunk_count
+                        )
+                        if self._apply_window_memory_anchor(
+                            phase_idx, window_memory_strength
+                        ):
+                            logger.info(
+                                "Chunk-{} reused window memory phase {} before generation.",
+                                chunk_idx,
+                                phase_idx,
+                            )
 
                 torch.cuda.synchronize()
                 start_time = time.time()
@@ -869,6 +1285,7 @@ class FlashTalkPipeline:
                 # inference
                 video = self.generate_chunk(audio_embedding_chunk)
                 video = video.cpu()
+                drift_score = 0.0
 
                 if chunk_idx == 0:
                     previous_stitched_tail = video[-motion_frames_num:].clone()
@@ -910,6 +1327,19 @@ class FlashTalkPipeline:
 
                     video = video[motion_frames_num:]
                     previous_stitched_tail = video[-motion_frames_num:].clone()
+
+                if window_memory_period > 0 and window_memory_strength > 0.0:
+                    phase_idx = self._get_context_phase_index(
+                        chunk_idx, chunk_count
+                    )
+                    if chunk_idx > 0 and adaptive_drift_refresh and drift_score >= drift_refresh_threshold:
+                        logger.info(
+                            "Skipping window memory cache update for phase {} due to elevated drift score {:.4f}.",
+                            phase_idx,
+                            drift_score,
+                        )
+                    else:
+                        self._update_window_memory_anchor(phase_idx)
 
                 torch.cuda.synchronize()
                 end_time = time.time()
@@ -944,8 +1374,10 @@ class FlashTalkPipeline:
             human_speech_array_slices = human_speech_array_all.reshape(
                 -1, human_speech_array_slice_len
             )
+            total_chunks = human_speech_array_slices.shape[0]
 
             for chunk_idx, human_speech_array in enumerate(human_speech_array_slices):
+                reanchored_this_chunk = False
                 if chunk_idx > 0:
                     should_periodic_reanchor = (
                         reanchor_every_n_chunks > 0
@@ -959,6 +1391,24 @@ class FlashTalkPipeline:
                         )
                         self._restore_reference_motion_anchor(reason)
                         force_reanchor_next_chunk = False
+                        reanchored_this_chunk = True
+
+                    if (
+                        window_memory_period > 0
+                        and window_memory_strength > 0.0
+                        and not reanchored_this_chunk
+                    ):
+                        phase_idx = self._get_context_phase_index(
+                            chunk_idx, total_chunks
+                        )
+                        if self._apply_window_memory_anchor(
+                            phase_idx, window_memory_strength
+                        ):
+                            logger.info(
+                                "Chunk-{} reused window memory phase {} before generation.",
+                                chunk_idx,
+                                phase_idx,
+                            )
 
                 # streaming encode audio chunks
                 audio_dq.extend(human_speech_array.tolist())
@@ -973,6 +1423,7 @@ class FlashTalkPipeline:
                 # inference
                 video = self.generate_chunk(audio_embedding)
                 video = video.cpu()
+                drift_score = 0.0
 
                 if chunk_idx == 0:
                     previous_stitched_tail = video[-motion_frames_num:].clone()
@@ -1015,6 +1466,19 @@ class FlashTalkPipeline:
                     video = video[motion_frames_num:]
                     previous_stitched_tail = video[-motion_frames_num:].clone()
 
+                if window_memory_period > 0 and window_memory_strength > 0.0:
+                    phase_idx = self._get_context_phase_index(
+                        chunk_idx, total_chunks
+                    )
+                    if chunk_idx > 0 and adaptive_drift_refresh and drift_score >= drift_refresh_threshold:
+                        logger.info(
+                            "Skipping window memory cache update for phase {} due to elevated drift score {:.4f}.",
+                            phase_idx,
+                            drift_score,
+                        )
+                    else:
+                        self._update_window_memory_anchor(phase_idx)
+
                 torch.cuda.synchronize()
                 end_time = time.time()
                 logger.info(
@@ -1027,6 +1491,23 @@ class FlashTalkPipeline:
         # offload dit model
         if self.vram_management:
             self.offload_dit_model()
+        if (
+            postprocess_seam_repair_frames > 0
+            or postprocess_temporal_smoothing_frames > 0
+            or postprocess_boundary_alignment
+        ):
+            logger.info(
+                "Post-process seam repair stage enabled: seam_frames={}, smoothing_frames={}, boundary_alignment={}",
+                postprocess_seam_repair_frames,
+                postprocess_temporal_smoothing_frames,
+                postprocess_boundary_alignment,
+            )
+            generated_list = self._repair_chunk_seams(
+                generated_list,
+                seam_frames=postprocess_seam_repair_frames,
+                smoothing_frames=postprocess_temporal_smoothing_frames,
+                boundary_alignment=postprocess_boundary_alignment,
+            )
         video_array = torch.cat(generated_list, dim=0).numpy().astype(np.uint8)
         video = Video(data=video_array, prompt=input_prompt, fps=tgt_fps)
         generate_end_time = time.perf_counter()

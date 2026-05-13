@@ -11,5 +11,16 @@ reanchor_every_n_chunks: 0
 adaptive_drift_refresh: false
 drift_refresh_threshold: 0.12
 latent_carryover_steps: 0
+postprocess_seam_repair_frames: 0
+postprocess_temporal_smoothing_frames: 0
+postprocess_boundary_alignment: false
+decoded_anchor_frames: 0
+window_memory_period: 0
+window_memory_strength: 0.0
+context_schedule: uniform_standard
+context_frames: 81
+context_stride: 4
+context_overlap: 16
+context_fuse_method: linear
 height: 768
 width: 448

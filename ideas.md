@@ -30,6 +30,7 @@ The same overlap-and-blend concept can be ported from spatial seams to temporal 
 - append only the blended transition plus new non-overlap frames
 
 This is the easiest real improvement beyond knob tuning.
+Implemented in `fast-flashtalk` as `temporal_crossfade_frames`.
 
 ## 3. Carry more latent state across chunks
 
@@ -45,6 +46,7 @@ A stronger fix would be to:
 Implemented in `fast-flashtalk` as the `latent_carryover_steps` flag, which carries a tail of the previous chunk's denoised latent forward into the next chunk.
 
 This should help the most with long-run drift, but it is more invasive than blending.
+The next level of this idea is also exposed as `decoded_anchor_frames`, which re-encodes more decoded tail frames as the latent anchor for the next chunk.
 
 ## 4. Periodic re-anchoring
 
@@ -57,6 +59,7 @@ This can help keep:
 - lighting
 
 more stable over long videos.
+Implemented as `reanchor_every_n_chunks`.
 
 ## 5. Drift detection
 
@@ -67,8 +70,55 @@ If a chunk starts drifting too far from the reference, adjust the next chunk by:
 - re-anchoring to the source frame
 
 This is more control logic than model logic, so it is better as a later refinement.
+Implemented as `adaptive_drift_refresh` + `drift_refresh_threshold`.
 
-## 6. FluxRT-style adaptive cache refresh
+## 6. Post-process seam repair
+
+After chunk generation, repair the stitched output by:
+
+- aligning the seam boundary
+- crossfading the overlap
+- applying a light temporal smoothing pass over the seam region
+
+Implemented in `fast-flashtalk` as:
+
+- `postprocess_seam_repair_frames`
+- `postprocess_temporal_smoothing_frames`
+- `postprocess_boundary_alignment`
+
+## 7. InfiniteTalk-style window memory
+
+This is the structured windowed-memory idea borrowed from `ComfyUI-InfiniteTalk-VideoSync`.
+
+Where it appears in `ComfyUI-InfiniteTalk-VideoSync`:
+
+- [`/Users/yuvraj/Desktop/Italk/ComfyUI-InfiniteTalk-VideoSync/vendor/wanvideo_wrapper/context_windows/context.py`](\/Users/yuvraj/Desktop/Italk/ComfyUI-InfiniteTalk-VideoSync/vendor/wanvideo_wrapper/context_windows/context.py)
+- [`/Users/yuvraj/Desktop/Italk/ComfyUI-InfiniteTalk-VideoSync/vendor/wanvideo_wrapper/nodes_sampler.py`](\/Users/yuvraj/Desktop/Italk/ComfyUI-InfiniteTalk-VideoSync/vendor/wanvideo_wrapper/nodes_sampler.py)
+
+What that repo does:
+
+- runs generation in context windows
+- applies overlap blending with explicit window masks
+- injects a reference latent into later windows when available
+- tracks persistent cache state by window pattern
+
+Why this helps `fast-flashtalk`:
+
+- the pipeline already has chunk boundaries and latent anchoring
+- a window-pattern cache gives us a more structured way to reuse stable reference state
+- it is a cleaner bridge between plain chunking and true recurrent memory
+
+Implemented in `fast-flashtalk` as:
+
+- `window_memory_period`
+- `window_memory_strength`
+- `context_schedule`
+- `context_frames`
+- `context_stride`
+- `context_overlap`
+- `context_fuse_method`
+
+## 8. FluxRT-style adaptive cache refresh
 
 This is the most useful idea borrowed from `FluxRT`.
 
@@ -106,6 +156,8 @@ These affect memory, audio handling, or color matching more than actual temporal
 
 1. Sweep `frame_num` and `motion_frames_num`
 2. Add temporal crossfade at chunk boundaries
-3. Add FluxRT-style adaptive drift detection / cache refresh
-4. If needed, carry richer latent state across chunks
-5. Add periodic re-anchoring only if long-run drift remains
+3. Add post-process seam repair
+4. Add InfiniteTalk-style window memory
+5. Add FluxRT-style adaptive drift detection / cache refresh
+6. If needed, carry richer latent state across chunks
+7. Add periodic re-anchoring only if long-run drift remains
