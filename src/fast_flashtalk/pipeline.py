@@ -561,6 +561,11 @@ class FlashTalkPipeline:
         audio: Audio,
         image: Image,
         audio_encode_mode: Literal["stream", "once"] = "once",
+        frame_num: int | None = None,
+        motion_frames_num: int | None = None,
+        sampling_steps: int | None = None,
+        color_correction_strength: float | None = None,
+        cached_audio_duration: int | None = None,
     ) -> Video:
         """
         Generate video from the audio and image prompt.
@@ -576,6 +581,11 @@ class FlashTalkPipeline:
             audio_encode_mode: Strategy for encoding audio, either "stream" or "once".
                 - "stream": Process audio in streaming chunks (default), memory efficient.
                 - "once": Encode entire audio at once then split into chunks.
+            frame_num: Optional override for the chunk length in frames.
+            motion_frames_num: Optional override for how many tail frames carry into the next chunk.
+            sampling_steps: Optional override for denoising steps per chunk.
+            color_correction_strength: Optional override for chunk color blending strength.
+            cached_audio_duration: Optional override for the streaming audio cache window.
             video_save_path: Path to save the generated video.
             merge_video_audio: Whether to merge the generated video and the original audio.
             force_9_16: Whether to force the video to be 9:16.
@@ -597,11 +607,36 @@ class FlashTalkPipeline:
         # prepare data
         sample_rate = self.infer_params["sample_rate"]
         tgt_fps = self.infer_params["tgt_fps"]
-        cached_audio_duration = self.infer_params["cached_audio_duration"]
-        frame_num = self.infer_params["frame_num"]
-        motion_frames_num = self.infer_params["motion_frames_num"]
+        cached_audio_duration = (
+            self.infer_params["cached_audio_duration"]
+            if cached_audio_duration is None
+            else cached_audio_duration
+        )
+        frame_num = self.infer_params["frame_num"] if frame_num is None else frame_num
+        motion_frames_num = (
+            self.infer_params["motion_frames_num"]
+            if motion_frames_num is None
+            else motion_frames_num
+        )
+        sampling_steps = (
+            self.infer_params["sample_steps"]
+            if sampling_steps is None
+            else sampling_steps
+        )
+        color_correction_strength = (
+            self.infer_params["color_correction_strength"]
+            if color_correction_strength is None
+            else color_correction_strength
+        )
         slice_len = frame_num - motion_frames_num
-        self.prepare_params(input_prompt=input_prompt, cond_image=image)
+        self.prepare_params(
+            input_prompt=input_prompt,
+            cond_image=image,
+            frame_num=frame_num,
+            motion_frames_num=motion_frames_num,
+            sampling_steps=sampling_steps,
+            color_correction_strength=color_correction_strength,
+        )
 
         human_speech_array_all = audio.load(
             sample_rate=self.infer_params["sample_rate"], mono=True
