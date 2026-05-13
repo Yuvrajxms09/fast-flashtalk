@@ -6,5 +6,10 @@ sample_steps: 4
 sample_shift: 5
 color_correction_strength: 1.0
 cached_audio_duration: 8
+temporal_crossfade_frames: 0
+reanchor_every_n_chunks: 0
+adaptive_drift_refresh: false
+drift_refresh_threshold: 0.12
+latent_carryover_steps: 0
 height: 768
 width: 448

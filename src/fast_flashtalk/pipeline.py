@@ -127,6 +127,9 @@ class FlashTalkPipeline:
 
         self.vae_stride = config.vae_stride
         self.patch_size = config.patch_size
+        self.base_latent_motion_frames = None
+        self.previous_chunk_latent_tail = None
+        self.latent_carryover_steps = 0
 
         self.vae = WanVAE(
             vae_path=os.path.join(checkpoint_dir, config.vae_checkpoint),
@@ -384,6 +387,7 @@ class FlashTalkPipeline:
         }
 
         self.latent_motion_frames = self.vae.encode(self.cond_image_tensor)
+        self.base_latent_motion_frames = self.latent_motion_frames.clone()
 
         if self.cpu_offload:
             self.vae.model.cpu()
@@ -472,6 +476,7 @@ class FlashTalkPipeline:
             )
 
             latent[:, : self.latent_motion_frames.shape[1]] = self.latent_motion_frames
+            latent = self._apply_latent_carryover(latent)
 
             for i in range(len(self.timesteps) - 1):
                 timestep = self.timesteps[i]
@@ -543,6 +548,7 @@ class FlashTalkPipeline:
         torch.cuda.synchronize()
         end_encode_time = time.time()
         logger.info(f"encode motion frames: {end_encode_time - start_encode_time:.2f}s")
+        self._update_latent_carryover_cache(latent)
 
         if self.cpu_offload:
             self.vae.model.cpu()
@@ -555,6 +561,110 @@ class FlashTalkPipeline:
         ).contiguous()
         return gen_video_samples
 
+    def _restore_reference_motion_anchor(self, reason: str) -> None:
+        if self.base_latent_motion_frames is None:
+            logger.warning("Requested motion anchor restore before reference latent was set.")
+            return
+
+        self.latent_motion_frames = self.base_latent_motion_frames.clone()
+        self.previous_chunk_latent_tail = None
+        logger.info("Restored reference motion anchor and cleared latent carryover cache: {}", reason)
+
+    def _apply_latent_carryover(self, latent: torch.Tensor) -> torch.Tensor:
+        carryover_steps = int(self.latent_carryover_steps)
+        if carryover_steps <= 0 or self.previous_chunk_latent_tail is None:
+            return latent
+
+        motion_seed_steps = int(self.latent_motion_frames.shape[1])
+        available_steps = latent.shape[1] - motion_seed_steps
+        if available_steps <= 0:
+            return latent
+
+        carryover_steps = min(
+            carryover_steps,
+            available_steps,
+            int(self.previous_chunk_latent_tail.shape[1]),
+        )
+        if carryover_steps <= 0:
+            return latent
+
+        latent[:, motion_seed_steps : motion_seed_steps + carryover_steps] = (
+            self.previous_chunk_latent_tail[:, -carryover_steps:]
+        )
+        logger.info(
+            "Applied latent carryover with {} temporal step(s) (requested={}, motion_seed_steps={}, available_steps={}).",
+            carryover_steps,
+            int(self.latent_carryover_steps),
+            motion_seed_steps,
+            available_steps,
+        )
+        return latent
+
+    def _update_latent_carryover_cache(self, latent: torch.Tensor) -> None:
+        carryover_steps = int(self.latent_carryover_steps)
+        if carryover_steps <= 0:
+            self.previous_chunk_latent_tail = None
+            return
+
+        carryover_steps = min(carryover_steps, int(latent.shape[1]))
+        if carryover_steps <= 0:
+            self.previous_chunk_latent_tail = None
+            return
+
+        self.previous_chunk_latent_tail = latent[:, -carryover_steps:].detach().clone()
+        logger.info(
+            "Cached latent carryover tail with {} temporal step(s) (requested={}).",
+            carryover_steps,
+            int(self.latent_carryover_steps),
+        )
+
+    @staticmethod
+    def _compute_boundary_drift_score(
+        previous_tail: torch.Tensor | None,
+        current_head: torch.Tensor | None,
+        overlap_frames: int,
+    ) -> float:
+        if previous_tail is None or current_head is None:
+            return 0.0
+
+        overlap_frames = min(
+            overlap_frames,
+            int(previous_tail.shape[0]),
+            int(current_head.shape[0]),
+        )
+        if overlap_frames <= 0:
+            return 0.0
+
+        prev = previous_tail[-overlap_frames:].to(torch.float32)
+        curr = current_head[:overlap_frames].to(torch.float32)
+        return torch.mean(torch.abs(prev - curr)).item() / 255.0
+
+    @staticmethod
+    def _apply_temporal_crossfade(
+        previous_chunk: torch.Tensor,
+        current_chunk: torch.Tensor,
+        blend_frames: int,
+    ) -> torch.Tensor:
+        blend_frames = min(
+            blend_frames,
+            int(previous_chunk.shape[0]),
+            int(current_chunk.shape[0]),
+        )
+        if blend_frames <= 0:
+            return previous_chunk
+
+        blend_weights = torch.linspace(
+            0.0,
+            1.0,
+            steps=blend_frames,
+            device=previous_chunk.device,
+            dtype=previous_chunk.dtype,
+        ).view(-1, 1, 1, 1)
+        blended_tail = previous_chunk[-blend_frames:] * (1 - blend_weights) + current_chunk[
+            :blend_frames
+        ] * blend_weights
+        return torch.cat([previous_chunk[:-blend_frames], blended_tail], dim=0)
+
     def generate(
         self,
         input_prompt: str,
@@ -566,6 +676,11 @@ class FlashTalkPipeline:
         sampling_steps: int | None = None,
         color_correction_strength: float | None = None,
         cached_audio_duration: int | None = None,
+        temporal_crossfade_frames: int | None = None,
+        reanchor_every_n_chunks: int | None = None,
+        adaptive_drift_refresh: bool | None = None,
+        drift_refresh_threshold: float | None = None,
+        latent_carryover_steps: int | None = None,
     ) -> Video:
         """
         Generate video from the audio and image prompt.
@@ -586,6 +701,11 @@ class FlashTalkPipeline:
             sampling_steps: Optional override for denoising steps per chunk.
             color_correction_strength: Optional override for chunk color blending strength.
             cached_audio_duration: Optional override for the streaming audio cache window.
+            temporal_crossfade_frames: Optional override for temporal crossfade strength at chunk joins.
+            reanchor_every_n_chunks: Optional override for periodic latent re-anchoring cadence.
+            adaptive_drift_refresh: Optional override to enable adaptive latent refresh when drift is high.
+            drift_refresh_threshold: Optional override for the normalized drift score threshold.
+            latent_carryover_steps: Optional override for how many latent time steps to carry from the prior chunk.
             video_save_path: Path to save the generated video.
             merge_video_audio: Whether to merge the generated video and the original audio.
             force_9_16: Whether to force the video to be 9:16.
@@ -628,7 +748,46 @@ class FlashTalkPipeline:
             if color_correction_strength is None
             else color_correction_strength
         )
+        temporal_crossfade_frames = (
+            self.infer_params["temporal_crossfade_frames"]
+            if temporal_crossfade_frames is None
+            else temporal_crossfade_frames
+        )
+        reanchor_every_n_chunks = (
+            self.infer_params["reanchor_every_n_chunks"]
+            if reanchor_every_n_chunks is None
+            else reanchor_every_n_chunks
+        )
+        adaptive_drift_refresh = (
+            self.infer_params["adaptive_drift_refresh"]
+            if adaptive_drift_refresh is None
+            else adaptive_drift_refresh
+        )
+        drift_refresh_threshold = (
+            self.infer_params["drift_refresh_threshold"]
+            if drift_refresh_threshold is None
+            else drift_refresh_threshold
+        )
+        latent_carryover_steps = (
+            self.infer_params["latent_carryover_steps"]
+            if latent_carryover_steps is None
+            else latent_carryover_steps
+        )
+
+        if temporal_crossfade_frames < 0:
+            raise ValueError("temporal_crossfade_frames must be >= 0")
+        if reanchor_every_n_chunks < 0:
+            raise ValueError("reanchor_every_n_chunks must be >= 0")
+        if drift_refresh_threshold < 0:
+            raise ValueError("drift_refresh_threshold must be >= 0")
+        if latent_carryover_steps < 0:
+            raise ValueError("latent_carryover_steps must be >= 0")
+        if frame_num <= motion_frames_num:
+            raise ValueError("frame_num must be greater than motion_frames_num")
+
         slice_len = frame_num - motion_frames_num
+        self.latent_carryover_steps = latent_carryover_steps
+        self.previous_chunk_latent_tail = None
         self.prepare_params(
             input_prompt=input_prompt,
             cond_image=image,
@@ -636,6 +795,15 @@ class FlashTalkPipeline:
             motion_frames_num=motion_frames_num,
             sampling_steps=sampling_steps,
             color_correction_strength=color_correction_strength,
+        )
+
+        logger.info(
+            "Boundary controls: temporal_crossfade_frames={}, reanchor_every_n_chunks={}, adaptive_drift_refresh={}, drift_refresh_threshold={:.4f}, latent_carryover_steps={}",
+            temporal_crossfade_frames,
+            reanchor_every_n_chunks,
+            adaptive_drift_refresh,
+            drift_refresh_threshold,
+            latent_carryover_steps,
         )
 
         human_speech_array_all = audio.load(
@@ -649,6 +817,8 @@ class FlashTalkPipeline:
         )
 
         generated_list = []
+        previous_stitched_tail = None
+        force_reanchor_next_chunk = False
         if audio_encode_mode == "once":
             # pad audio with silence to avoid truncating the last chunk
             remainder = (
@@ -679,14 +849,67 @@ class FlashTalkPipeline:
             for chunk_idx, audio_embedding_chunk in enumerate(
                 audio_embedding_chunks_list
             ):
+                if chunk_idx > 0:
+                    should_periodic_reanchor = (
+                        reanchor_every_n_chunks > 0
+                        and chunk_idx % reanchor_every_n_chunks == 0
+                    )
+                    if force_reanchor_next_chunk or should_periodic_reanchor:
+                        reason = (
+                            "adaptive drift refresh"
+                            if force_reanchor_next_chunk
+                            else f"periodic cadence every {reanchor_every_n_chunks} chunk(s)"
+                        )
+                        self._restore_reference_motion_anchor(reason)
+                        force_reanchor_next_chunk = False
+
                 torch.cuda.synchronize()
                 start_time = time.time()
 
                 # inference
                 video = self.generate_chunk(audio_embedding_chunk)
+                video = video.cpu()
 
-                if chunk_idx != 0:
+                if chunk_idx == 0:
+                    previous_stitched_tail = video[-motion_frames_num:].clone()
+                else:
+                    current_head = video[:motion_frames_num]
+                    drift_score = self._compute_boundary_drift_score(
+                        previous_stitched_tail,
+                        current_head,
+                        motion_frames_num,
+                    )
+                    logger.info(
+                        "Chunk-{} boundary drift score: {:.4f}",
+                        chunk_idx,
+                        drift_score,
+                    )
+                    if adaptive_drift_refresh and drift_score >= drift_refresh_threshold:
+                        force_reanchor_next_chunk = True
+                        logger.warning(
+                            "Chunk-{} drift score {:.4f} exceeded threshold {:.4f}; scheduling reference latent refresh before chunk-{}.",
+                            chunk_idx,
+                            drift_score,
+                            drift_refresh_threshold,
+                            chunk_idx + 1,
+                        )
+
+                    if temporal_crossfade_frames > 0:
+                        blend_frames = min(temporal_crossfade_frames, motion_frames_num)
+                        generated_list[-1] = self._apply_temporal_crossfade(
+                            generated_list[-1],
+                            video,
+                            blend_frames,
+                        )
+                        logger.info(
+                            "Chunk-{} temporal crossfade applied with {} frame(s) (requested={}).",
+                            chunk_idx,
+                            blend_frames,
+                            temporal_crossfade_frames,
+                        )
+
                     video = video[motion_frames_num:]
+                    previous_stitched_tail = video[-motion_frames_num:].clone()
 
                 torch.cuda.synchronize()
                 end_time = time.time()
@@ -694,7 +917,7 @@ class FlashTalkPipeline:
                     f"Generate video chunk-{chunk_idx} done, cost time: {(end_time - start_time):.2f}s"
                 )
 
-                generated_list.append(video.cpu())
+                generated_list.append(video)
                 torch.cuda.empty_cache()
 
         elif audio_encode_mode == "stream":
@@ -723,6 +946,20 @@ class FlashTalkPipeline:
             )
 
             for chunk_idx, human_speech_array in enumerate(human_speech_array_slices):
+                if chunk_idx > 0:
+                    should_periodic_reanchor = (
+                        reanchor_every_n_chunks > 0
+                        and chunk_idx % reanchor_every_n_chunks == 0
+                    )
+                    if force_reanchor_next_chunk or should_periodic_reanchor:
+                        reason = (
+                            "adaptive drift refresh"
+                            if force_reanchor_next_chunk
+                            else f"periodic cadence every {reanchor_every_n_chunks} chunk(s)"
+                        )
+                        self._restore_reference_motion_anchor(reason)
+                        force_reanchor_next_chunk = False
+
                 # streaming encode audio chunks
                 audio_dq.extend(human_speech_array.tolist())
                 audio_array = np.array(audio_dq)
@@ -735,7 +972,48 @@ class FlashTalkPipeline:
 
                 # inference
                 video = self.generate_chunk(audio_embedding)
-                video = video[motion_frames_num:]
+                video = video.cpu()
+
+                if chunk_idx == 0:
+                    previous_stitched_tail = video[-motion_frames_num:].clone()
+                else:
+                    current_head = video[:motion_frames_num]
+                    drift_score = self._compute_boundary_drift_score(
+                        previous_stitched_tail,
+                        current_head,
+                        motion_frames_num,
+                    )
+                    logger.info(
+                        "Chunk-{} boundary drift score: {:.4f}",
+                        chunk_idx,
+                        drift_score,
+                    )
+                    if adaptive_drift_refresh and drift_score >= drift_refresh_threshold:
+                        force_reanchor_next_chunk = True
+                        logger.warning(
+                            "Chunk-{} drift score {:.4f} exceeded threshold {:.4f}; scheduling reference latent refresh before chunk-{}.",
+                            chunk_idx,
+                            drift_score,
+                            drift_refresh_threshold,
+                            chunk_idx + 1,
+                        )
+
+                    if temporal_crossfade_frames > 0:
+                        blend_frames = min(temporal_crossfade_frames, motion_frames_num)
+                        generated_list[-1] = self._apply_temporal_crossfade(
+                            generated_list[-1],
+                            video,
+                            blend_frames,
+                        )
+                        logger.info(
+                            "Chunk-{} temporal crossfade applied with {} frame(s) (requested={}).",
+                            chunk_idx,
+                            blend_frames,
+                            temporal_crossfade_frames,
+                        )
+
+                    video = video[motion_frames_num:]
+                    previous_stitched_tail = video[-motion_frames_num:].clone()
 
                 torch.cuda.synchronize()
                 end_time = time.time()
@@ -743,7 +1021,7 @@ class FlashTalkPipeline:
                     f"Generate video chunk-{chunk_idx} done, cost time: {(end_time - start_time):.2f}s"
                 )
 
-                generated_list.append(video.cpu())
+                generated_list.append(video)
                 torch.cuda.empty_cache()
 
         # offload dit model
