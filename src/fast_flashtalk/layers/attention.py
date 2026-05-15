@@ -42,12 +42,37 @@ class SingleStreamAttention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
 
         self.kv_linear = nn.Linear(encoder_hidden_states_dim, dim * 2, bias=qkv_bias)
+        self._kv_cache = None
 
         self.add_q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         self.add_k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
 
     def clear_runtime_cache(self):
-        return
+        self._kv_cache = None
+
+    def _get_cached_kv(self, encoder_hidden_states: torch.Tensor):
+        cache_key = (
+            encoder_hidden_states.data_ptr(),
+            tuple(encoder_hidden_states.shape),
+            encoder_hidden_states.device.type,
+            encoder_hidden_states.device.index,
+            encoder_hidden_states.dtype,
+        )
+        if self._kv_cache is not None:
+            cached_key, cached_k, cached_v = self._kv_cache
+            if cached_key == cache_key:
+                return cached_k, cached_v
+
+        if hasattr(self, "kv"):
+            encoder_kv = self.kv(encoder_hidden_states)
+        else:
+            encoder_kv = self.kv_linear(encoder_hidden_states)
+
+        encoder_k, encoder_v = encoder_kv.chunk(2, dim=-1)
+        if self.qk_norm:
+            encoder_k = self.add_k_norm(encoder_k)
+        self._kv_cache = (cache_key, encoder_k, encoder_v)
+        return encoder_k, encoder_v
 
     def forward(
         self,
@@ -138,7 +163,7 @@ class SingleStreamMutiAttention(SingleStreamAttention):
         self.rope_1d = RotaryPositionalEmbedding1D(self.head_dim)
 
     def clear_runtime_cache(self):
-        return
+        super().clear_runtime_cache()
 
     def forward(
         self,
