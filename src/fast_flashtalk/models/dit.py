@@ -491,10 +491,78 @@ class WanModel(ModelMixin, ConfigMixin):
             context_tokens=context_tokens,
             norm_output_audio=norm_output_audio,
         )
+        self._freqs_cache = {}
+        self._audio_context_cache = None
 
         # initialize weights
         if weight_init:
             self.init_weights()
+
+    def _get_cached_freqs(self, freqs_shape: torch.Size, device: torch.device):
+        cache_key = (tuple(freqs_shape), device.type, device.index)
+        freqs = self._freqs_cache.get(cache_key)
+        if freqs is None:
+            freqs = self.rope.generate_embeddings(B_T_H_W_C=freqs_shape).to(device)
+            self._freqs_cache[cache_key] = freqs
+        return freqs
+
+    def _get_audio_context(
+        self, audio: torch.Tensor, device: torch.device, x_dtype: torch.dtype
+    ):
+        cache_key = (
+            audio.data_ptr(),
+            tuple(audio.shape),
+            device.type,
+            device.index,
+            x_dtype,
+        )
+        if self._audio_context_cache is not None:
+            cached_key, cached_audio_embedding, cached_human_num = self._audio_context_cache
+            if cached_key == cache_key:
+                return cached_audio_embedding, cached_human_num
+
+        audio_cond = audio.to(device=device, dtype=x_dtype)
+        first_frame_audio_emb_s = audio_cond[:, :1, ...]  # b 1 w s c
+        latter_frame_audio_emb = audio_cond[:, 1:, ...]
+        latter_frame_audio_emb = rearrange(
+            latter_frame_audio_emb, "b (n_t n) w s c -> b n_t n w s c", n=self.vae_scale
+        )
+        middle_index = self.audio_window // 2
+        latter_first_frame_audio_emb = latter_frame_audio_emb[
+            :, :, :1, : middle_index + 1, ...
+        ]
+        latter_first_frame_audio_emb = rearrange(
+            latter_first_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c"
+        )  # b n_t (1 3) s c
+        latter_last_frame_audio_emb = latter_frame_audio_emb[
+            :, :, -1:, middle_index:, ...
+        ]
+        latter_last_frame_audio_emb = rearrange(
+            latter_last_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c"
+        )  # b n_t (1 3) s c
+        latter_middle_frame_audio_emb = latter_frame_audio_emb[
+            :, :, 1:-1, middle_index : middle_index + 1, ...
+        ]
+        latter_middle_frame_audio_emb = rearrange(
+            latter_middle_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c"
+        )  # b n_t (2 1) s c
+
+        latter_frame_audio_emb_s = torch.concat(
+            [
+                latter_first_frame_audio_emb,
+                latter_middle_frame_audio_emb,
+                latter_last_frame_audio_emb,
+            ],
+            dim=2,
+        )
+        audio_embedding = self.audio_proj(
+            first_frame_audio_emb_s, latter_frame_audio_emb_s
+        )
+        human_num = len(audio_embedding)
+        audio_embedding = torch.concat(audio_embedding.split(1), dim=2).to(x_dtype)
+
+        self._audio_context_cache = (cache_key, audio_embedding, human_num)
+        return audio_embedding, human_num
 
     def forward(
         self,
@@ -520,7 +588,7 @@ class WanModel(ModelMixin, ConfigMixin):
         N_w = W // self.patch_size[2]
 
         freqs_shape = torch.Size([B, T, H // 2, W // 2, self.head_dim])
-        self.freqs = self.rope.generate_embeddings(B_T_H_W_C=freqs_shape)
+        self.freqs = self._get_cached_freqs(freqs_shape, x[0].device)
 
         if y is not None:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
@@ -564,49 +632,7 @@ class WanModel(ModelMixin, ConfigMixin):
             context_clip = self.img_emb(clip_fea)
             context = torch.concat([context_clip, context], dim=1).to(x.dtype)
 
-        audio_cond = audio.to(device=x.device, dtype=x.dtype)
-        first_frame_audio_emb_s = audio_cond[:, :1, ...]  # b 1 w s c
-        latter_frame_audio_emb = audio_cond[:, 1:, ...]
-        latter_frame_audio_emb = rearrange(
-            latter_frame_audio_emb, "b (n_t n) w s c -> b n_t n w s c", n=self.vae_scale
-        )
-        middle_index = self.audio_window // 2
-        latter_first_frame_audio_emb = latter_frame_audio_emb[
-            :, :, :1, : middle_index + 1, ...
-        ]
-        latter_first_frame_audio_emb = rearrange(
-            latter_first_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c"
-        )  # b n_t (1 3) s c
-        latter_last_frame_audio_emb = latter_frame_audio_emb[
-            :, :, -1:, middle_index:, ...
-        ]
-        latter_last_frame_audio_emb = rearrange(
-            latter_last_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c"
-        )  # b n_t (1 3) s c
-        latter_middle_frame_audio_emb = latter_frame_audio_emb[
-            :, :, 1:-1, middle_index : middle_index + 1, ...
-        ]
-        latter_middle_frame_audio_emb = rearrange(
-            latter_middle_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c"
-        )  # b n_t (2 1) s c
-
-        latter_frame_audio_emb_s = torch.concat(
-            [
-                latter_first_frame_audio_emb,
-                latter_middle_frame_audio_emb,
-                latter_last_frame_audio_emb,
-            ],
-            dim=2,
-        )
-        audio_embedding = self.audio_proj(
-            first_frame_audio_emb_s, latter_frame_audio_emb_s
-        )
-        human_num = len(audio_embedding)
-        # if False:
-        #     audio_embedding = torch.concat(audio_embedding.split(1), dim=2).to(x.dtype)
-        # else:
-        #     audio_embedding = audio_embedding.to(x.dtype)
-        audio_embedding = torch.concat(audio_embedding.split(1), dim=2).to(x.dtype)
+        audio_embedding, human_num = self._get_audio_context(audio, x.device, x.dtype)
 
         # convert ref_target_masks to token_ref_target_masks
         if ref_target_masks is not None:

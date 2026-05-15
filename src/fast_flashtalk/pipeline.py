@@ -145,6 +145,7 @@ class FlashTalkPipeline:
         self.context_overlap = 16
         self.context_fuse_method = "linear"
         self.last_generation_debug = None
+        self.enable_timing_logs = os.environ.get("ENABLE_TIMING_LOGS", "0") == "1"
 
         self.vae = WanVAE(
             vae_path=os.path.join(checkpoint_dir, config.vae_checkpoint),
@@ -508,13 +509,17 @@ class FlashTalkPipeline:
                     self.onload_dit_model()
 
                 # inference without CFG
-                start_time = time.perf_counter()
+                if self.enable_timing_logs:
+                    start_time = time.perf_counter()
                 noise_pred_cond = self.model(
                     latent_model_input, t=timestep, **self.arg_c
                 )[0]
-                torch.cuda.synchronize()
-                end_time = time.perf_counter()
-                logger.info(f"model denoise per step: {end_time - start_time:.2f}s")
+                if self.enable_timing_logs:
+                    torch.cuda.synchronize()
+                    end_time = time.perf_counter()
+                    logger.info(
+                        f"model denoise per step: {end_time - start_time:.2f}s"
+                    )
 
                 noise_pred = -noise_pred_cond
 
@@ -541,17 +546,18 @@ class FlashTalkPipeline:
                 self.vae.scale[0] = self.vae.scale[0].to(self.device)
                 self.vae.scale[1] = self.vae.scale[1].to(self.device)
 
-            torch.cuda.synchronize()
-            start_decode_time = time.time()
+            if self.enable_timing_logs:
+                start_decode_time = time.time()
             videos = self.vae.decode(latent.to(self.param_dtype))
-            torch.cuda.synchronize()
-            end_decode_time = time.time()
-            logger.info(
-                f"decode video frames: {end_decode_time - start_decode_time:.2f}s"
-            )
+            if self.enable_timing_logs:
+                torch.cuda.synchronize()
+                end_decode_time = time.time()
+                logger.info(
+                    f"decode video frames: {end_decode_time - start_decode_time:.2f}s"
+                )
 
-        torch.cuda.synchronize()
-        start_color_correction_time = time.time()
+        if self.enable_timing_logs:
+            start_color_correction_time = time.time()
         if self.color_correction_strength > 0.0:
             videos = match_and_blend_colors_torch(
                 videos, self.original_color_reference, self.color_correction_strength
@@ -562,23 +568,25 @@ class FlashTalkPipeline:
         cond_frame = videos[:, :, -anchor_frames:]
         if cond_frame.device != torch.device(self.device):
             cond_frame = cond_frame.to(self.device)
-        torch.cuda.synchronize()
-        end_color_correction_time = time.time()
-        logger.info(
-            f"color correction: {end_color_correction_time - start_color_correction_time:.2f}s"
-        )
+        if self.enable_timing_logs:
+            torch.cuda.synchronize()
+            end_color_correction_time = time.time()
+            logger.info(
+                f"color correction: {end_color_correction_time - start_color_correction_time:.2f}s"
+            )
 
-        torch.cuda.synchronize()
-        start_encode_time = time.time()
+        if self.enable_timing_logs:
+            start_encode_time = time.time()
         self.latent_motion_frames = self.vae.encode(cond_frame)
-        torch.cuda.synchronize()
-        end_encode_time = time.time()
-        logger.info(
-            "encode motion frames: {:.2f}s (anchor_frames={}, latent_steps={})",
-            end_encode_time - start_encode_time,
-            anchor_frames,
-            int(self.latent_motion_frames.shape[1]),
-        )
+        if self.enable_timing_logs:
+            torch.cuda.synchronize()
+            end_encode_time = time.time()
+            logger.info(
+                "encode motion frames: {:.2f}s (anchor_frames={}, latent_steps={})",
+                end_encode_time - start_encode_time,
+                anchor_frames,
+                int(self.latent_motion_frames.shape[1]),
+            )
         self._update_latent_carryover_cache(latent)
 
         if self.offload_aux_components:
@@ -1406,8 +1414,9 @@ class FlashTalkPipeline:
                                 phase_idx,
                             )
 
-                torch.cuda.synchronize()
-                start_time = time.time()
+                if self.enable_timing_logs:
+                    torch.cuda.synchronize()
+                    start_time = time.time()
 
                 # inference
                 video = self.generate_chunk(audio_embedding_chunk)
@@ -1509,11 +1518,12 @@ class FlashTalkPipeline:
                 )
                 stitched_frame_cursor += int(video.shape[0])
 
-                torch.cuda.synchronize()
-                end_time = time.time()
-                logger.info(
-                    f"Generate video chunk-{chunk_idx} done, cost time: {(end_time - start_time):.2f}s"
-                )
+                if self.enable_timing_logs:
+                    torch.cuda.synchronize()
+                    end_time = time.time()
+                    logger.info(
+                        f"Generate video chunk-{chunk_idx} done, cost time: {(end_time - start_time):.2f}s"
+                    )
 
                 generated_list.append(video)
 
@@ -1590,8 +1600,9 @@ class FlashTalkPipeline:
                     audio_array, audio_start_idx, audio_end_idx
                 )
 
-                torch.cuda.synchronize()
-                start_time = time.time()
+                if self.enable_timing_logs:
+                    torch.cuda.synchronize()
+                    start_time = time.time()
 
                 # inference
                 video = self.generate_chunk(audio_embedding)
@@ -1693,11 +1704,12 @@ class FlashTalkPipeline:
                 )
                 stitched_frame_cursor += int(video.shape[0])
 
-                torch.cuda.synchronize()
-                end_time = time.time()
-                logger.info(
-                    f"Generate video chunk-{chunk_idx} done, cost time: {(end_time - start_time):.2f}s"
-                )
+                if self.enable_timing_logs:
+                    torch.cuda.synchronize()
+                    end_time = time.time()
+                    logger.info(
+                        f"Generate video chunk-{chunk_idx} done, cost time: {(end_time - start_time):.2f}s"
+                    )
 
                 generated_list.append(video)
 
