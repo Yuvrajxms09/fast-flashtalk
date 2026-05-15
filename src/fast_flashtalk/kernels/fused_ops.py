@@ -257,17 +257,14 @@ def _fused_ffn_kernel(
         )
         hidden += bias1[None, :]
 
-        gelu_arg = 0.7978845608028654 * (
-            hidden + 0.044715 * hidden * hidden * hidden
-        )
-        exp_2x = tl.exp(2.0 * gelu_arg)
-        hidden = 0.5 * hidden * ((exp_2x - 1.0) / (exp_2x + 1.0) + 1.0)
+        hidden = hidden.to(tl.bfloat16)
+        hidden = 0.5 * hidden * (1.0 + tl.sigmoid(1.702 * hidden))
 
         w2 = tl.load(
             w2_ptr + offs_n[None, :] * stride_w2o + offs_h[:, None] * stride_w2i,
             mask=n_mask[None, :] & h_mask[:, None],
             other=0.0,
-        )
+        ).to(tl.bfloat16)
         acc = tl.dot(hidden, w2, acc=acc, out_dtype=tl.float32)
 
     acc += bias2[None, :]
