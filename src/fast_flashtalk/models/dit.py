@@ -16,6 +16,7 @@ from ..kernels.fused_ops import (
     fused_affine,
     fused_residual_add,
     fused_residual_mul_add,
+    fused_rms_norm,
 )
 from ..kernels.rope import fast_rope_apply, sinusoidal_embedding_1d
 from ..kernels.attn import attention
@@ -31,12 +32,24 @@ class WanRMSNorm(nn.Module):
         self.dim = dim
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
+        self._triton_logged = False
+        self._triton_calls = 0
 
     def forward(self, x):
         r"""
         Args:
             x(Tensor): Shape [B, L, C]
         """
+        if x.is_cuda and x.dim() == 3:
+            if ENABLE_FUSED_OP_LOGS and not self._triton_logged:
+                logger.info(
+                    "WanRMSNorm using Triton RMSNorm path for dim={} dtype={}",
+                    self.dim,
+                    x.dtype,
+                )
+                self._triton_logged = True
+            self._triton_calls += 1
+            return fused_rms_norm(x, self.weight, self.eps)
         return self._norm(x.float()).type_as(x) * self.weight
 
     def _norm(self, x):
@@ -97,6 +110,9 @@ class WanSelfAttention(nn.Module):
         del self.q
         del self.k
         del self.v
+
+    def clear_runtime_cache(self):
+        return
 
     def forward(self, x, seq_lens, grid_sizes, freqs, ref_target_masks=None):
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
@@ -691,6 +707,10 @@ class WanModel(ModelMixin, ConfigMixin):
             block.self_attn.clear_runtime_cache()
             block.cross_attn.clear_runtime_cache()
             block.audio_cross_attn.clear_runtime_cache()
+        for module in self.modules():
+            if isinstance(module, WanRMSNorm):
+                module._triton_calls = 0
+                module._triton_logged = False
         if ENABLE_FUSED_OP_LOGS:
             logger.info("Cleared Wan runtime caches before forward pass")
 
@@ -804,11 +824,17 @@ class WanModel(ModelMixin, ConfigMixin):
             fused_self_attn = sum(hasattr(block.self_attn, "qkv") for block in self.blocks)
             fused_context_kv = sum(hasattr(block.cross_attn, "kv") for block in self.blocks)
             fused_image_kv = sum(hasattr(block.cross_attn, "kv_img") for block in self.blocks)
+            rmsnorm_triton_calls = sum(
+                getattr(module, "_triton_calls", 0)
+                for module in self.modules()
+                if isinstance(module, WanRMSNorm)
+            )
             logger.info(
-                "Wan runtime summary: fused_self_attn={}, fused_context_kv={}, fused_image_kv={}",
+                "Wan runtime summary: fused_self_attn={}, fused_context_kv={}, fused_image_kv={}, rmsnorm_triton_calls={}",
                 fused_self_attn,
                 fused_context_kv,
                 fused_image_kv,
+                rmsnorm_triton_calls,
             )
 
         return torch.stack(x).float()

@@ -10,6 +10,39 @@ def _ensure_3d(x: torch.Tensor) -> torch.Tensor:
 
 
 @triton.jit
+def _fused_rms_norm_kernel(
+    x_ptr,
+    weight_ptr,
+    out_ptr,
+    stride_b,
+    stride_s,
+    stride_c,
+    stride_w,
+    n_cols,
+    eps,
+    BLOCK_C: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    pid_s = tl.program_id(1)
+    offs_c = tl.arange(0, BLOCK_C)
+    mask = offs_c < n_cols
+
+    x = tl.load(
+        x_ptr + pid_b * stride_b + pid_s * stride_s + offs_c * stride_c,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    inv_rms = tl.rsqrt(tl.sum(x * x, axis=0) / n_cols + eps)
+    weight = tl.load(weight_ptr + offs_c * stride_w, mask=mask, other=0.0).to(tl.float32)
+    out = x * inv_rms * weight
+    tl.store(
+        out_ptr + pid_b * stride_b + pid_s * stride_s + offs_c * stride_c,
+        out,
+        mask=mask,
+    )
+
+
+@triton.jit
 def _fused_affine_kernel(
     x_ptr,
     scale_ptr,
@@ -258,6 +291,39 @@ def fused_residual_mul_add(
         out.stride(1),
         out.stride(2),
         x.shape[-1],
+        BLOCK_C=block_c,
+    )
+    return out
+
+
+def fused_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    if not x.is_cuda or x.dim() != 3:
+        return x * torch.rsqrt(x.float().pow(2).mean(dim=-1, keepdim=True) + eps) * weight
+
+    x = _ensure_3d(x)
+    if x.shape[-1] != weight.shape[0]:
+        raise ValueError(
+            f"weight shape {tuple(weight.shape)} does not match x last dim {x.shape[-1]}"
+        )
+
+    n_cols = x.shape[-1]
+    block_c = triton.next_power_of_2(n_cols)
+    if block_c > 4096:
+        return x * torch.rsqrt(x.float().pow(2).mean(dim=-1, keepdim=True) + eps) * weight
+
+    out = torch.empty_like(x)
+    grid = (x.shape[0], x.shape[1])
+
+    _fused_rms_norm_kernel[grid](
+        x,
+        weight,
+        out,
+        x.stride(0),
+        x.stride(1),
+        x.stride(2),
+        weight.stride(0),
+        n_cols,
+        eps,
         BLOCK_C=block_c,
     )
     return out
