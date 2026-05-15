@@ -19,7 +19,7 @@ from ..kernels.fused_ops import (
     fused_residual_mul_add,
     fused_rms_norm,
 )
-from ..kernels.rope import fast_rope_apply, fast_rope_apply_qkv, sinusoidal_embedding_1d
+from ..kernels.rope import fast_rope_apply, sinusoidal_embedding_1d
 from ..kernels.attn import attention
 from ..utils import get_attn_map_with_target
 
@@ -115,6 +115,7 @@ class WanSelfAttention(nn.Module):
         del self.v
 
     def clear_runtime_cache(self):
+        self._qkv_rope_calls = 0
         return
 
     def forward(self, x, seq_lens, grid_sizes, freqs, ref_target_masks=None):
@@ -125,7 +126,7 @@ class WanSelfAttention(nn.Module):
         if hasattr(self, "qkv"):
             if ENABLE_FUSED_OP_LOGS and not self._qkv_rope_logged:
                 logger.info(
-                    "WanSelfAttention using fused qkv RoPE path for dim={} heads={} head_dim={}",
+                    "WanSelfAttention using fused qkv projection path for dim={} heads={} head_dim={}",
                     self.dim,
                     self.num_heads,
                     self.head_dim,
@@ -889,7 +890,7 @@ class WanModel(ModelMixin, ConfigMixin):
             fused_self_attn = sum(hasattr(block.self_attn, "qkv") for block in self.blocks)
             fused_context_kv = sum(hasattr(block.cross_attn, "kv") for block in self.blocks)
             fused_image_kv = sum(hasattr(block.cross_attn, "kv_img") for block in self.blocks)
-            fused_qkv_rope_calls = sum(
+            fused_qkv_calls = sum(
                 getattr(block.self_attn, "_qkv_rope_calls", 0) for block in self.blocks
             )
             fused_ffn_calls = sum(
@@ -903,11 +904,11 @@ class WanModel(ModelMixin, ConfigMixin):
                 if isinstance(module, WanRMSNorm)
             )
             logger.info(
-                "Wan runtime summary: fused_self_attn={}, fused_context_kv={}, fused_image_kv={}, fused_qkv_rope_calls={}, fused_ffn_calls={}, rmsnorm_triton_calls={}",
+                "Wan runtime summary: fused_self_attn={}, fused_context_kv={}, fused_image_kv={}, fused_qkv_calls={}, fused_ffn_calls={}, rmsnorm_triton_calls={}",
                 fused_self_attn,
                 fused_context_kv,
                 fused_image_kv,
-                fused_qkv_rope_calls,
+                fused_qkv_calls,
                 fused_ffn_calls,
                 rmsnorm_triton_calls,
             )
