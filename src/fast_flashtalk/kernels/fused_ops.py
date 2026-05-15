@@ -257,8 +257,9 @@ def _fused_ffn_kernel(
         )
         hidden += bias1[None, :]
 
-        hidden = hidden.to(tl.bfloat16)
-        hidden = 0.5 * hidden * (1.0 + tl.sigmoid(1.702 * hidden))
+        hidden_fp32 = hidden
+        hidden_fp32 = 0.5 * hidden_fp32 * (1.0 + tl.sigmoid(1.702 * hidden_fp32))
+        hidden = hidden_fp32.to(tl.bfloat16)
 
         w2 = tl.load(
             w2_ptr + offs_n[None, :] * stride_w2o + offs_h[:, None] * stride_w2i,
