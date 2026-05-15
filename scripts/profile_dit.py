@@ -81,6 +81,7 @@ def main() -> None:
     num_persistent_param_in_dit = env_int("NUM_PERSISTENT_PARAM_IN_DIT", 15_000_000_000)
     weight_bits = env_int("WEIGHT_BITS", 8)
     keep_dit_on_gpu = env_bool("KEEP_DIT_ON_GPU", True)
+    keep_aux_components_on_gpu = env_bool("KEEP_AUX_COMPONENTS_ON_GPU", False)
     warmup_runs = env_int("WARMUP_RUNS", 1)
     profile_mode = os.environ.get("PROFILE_MODE", "dit").lower()
     audio_encode_mode = os.environ.get("AUDIO_ENCODE_MODE", "once")
@@ -90,6 +91,7 @@ def main() -> None:
     print(f"Checkpoint: {checkpoint_dir} (OK)")
     print(f"Wav2Vec: {wav2vec_dir} (OK)")
     print(f"Target size: {target_size}")
+    print(f"Keep aux components on GPU: {keep_aux_components_on_gpu}")
     print(f"Warmup runs: {warmup_runs}")
 
     pipeline = FlashTalkPipeline(
@@ -97,6 +99,7 @@ def main() -> None:
         wav2vec_dir=wav2vec_dir,
         num_persistent_param_in_dit=num_persistent_param_in_dit,
         keep_dit_on_gpu=keep_dit_on_gpu,
+        keep_aux_components_on_gpu=keep_aux_components_on_gpu,
         weight_bits=weight_bits,
         device=f"cuda:{cuda_device_index}",
     )

@@ -77,6 +77,7 @@ class FlashTalkPipeline:
         use_timestep_transform=True,
         num_persistent_param_in_dit=15_000_000_000,
         keep_dit_on_gpu=False,
+        keep_aux_components_on_gpu=False,
         quantize_weights=True,
         weight_bits=8,
     ):
@@ -92,6 +93,8 @@ class FlashTalkPipeline:
                 Enable timestep transform.
             num_persistent_param_in_dit (`int`, *optional*, defaults to 15_000_000_000):
                 Number of persistent parameters in DIT model.
+            keep_aux_components_on_gpu (`bool`, *optional*, defaults to False):
+                Keep T5, CLIP, VAE, audio encoder, and chunk outputs resident on GPU.
             quantize_weights (`bool`, *optional*, defaults to True):
                 Quantize DiT weights at load time using GemLite. Set to False to keep
                 the checkpoint weights in their original dtype and rely on VRAM
@@ -114,13 +117,15 @@ class FlashTalkPipeline:
         self.param_dtype = config.param_dtype
         self.cpu_offload = True
         self.keep_dit_on_gpu = keep_dit_on_gpu
+        self.keep_aux_components_on_gpu = keep_aux_components_on_gpu
+        self.offload_aux_components = not keep_aux_components_on_gpu
         self.quantize_weights = quantize_weights
         self.weight_bits = weight_bits
 
         self.text_encoder = T5EncoderModel(
             text_len=config.text_len,
             dtype=config.t5_dtype,
-            device="cpu" if self.cpu_offload else self.device,
+            device=self.device if self.keep_aux_components_on_gpu else "cpu",
             checkpoint_path=os.path.join(checkpoint_dir, config.t5_checkpoint),
             tokenizer_path=os.path.join(checkpoint_dir, config.t5_tokenizer),
         )
@@ -144,13 +149,13 @@ class FlashTalkPipeline:
         self.vae = WanVAE(
             vae_path=os.path.join(checkpoint_dir, config.vae_checkpoint),
             dtype=self.param_dtype,
-            device="cpu" if self.cpu_offload else self.device,
+            device=self.device if self.keep_aux_components_on_gpu else "cpu",
             parallel=False,
         )
 
         self.clip = CLIPModel(
             dtype=config.clip_dtype,
-            device="cpu" if self.cpu_offload else self.device,
+            device=self.device if self.keep_aux_components_on_gpu else "cpu",
             checkpoint_path=os.path.join(checkpoint_dir, config.clip_checkpoint),
             tokenizer_path=os.path.join(checkpoint_dir, config.clip_tokenizer),
         )
@@ -196,7 +201,7 @@ class FlashTalkPipeline:
 
         self.audio_encoder = Wav2Vec2Model.from_pretrained(
             wav2vec_dir, local_files_only=True
-        ).to("cpu")
+        ).to(self.device if self.keep_aux_components_on_gpu else "cpu")
         self.audio_encoder.feature_extractor._freeze_parameters()
         self.wav2vec_feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(
             wav2vec_dir, local_files_only=True
@@ -298,7 +303,13 @@ class FlashTalkPipeline:
         color_correction_strength: float = 1.0,
     ):
 
-        context = self.text_encoder(input_prompt, self.device)[0].to(self.device)
+        context = self.text_encoder(
+            input_prompt,
+            self.device,
+            offload_to_cpu=self.offload_aux_components,
+        )[0]
+        if context.device != torch.device(self.device):
+            context = context.to(self.device)
 
         self.frame_num = frame_num
         self.motion_frames_num = motion_frames_num
@@ -319,12 +330,12 @@ class FlashTalkPipeline:
         if self.color_correction_strength > 0.0:
             self.original_color_reference = cond_image_tensor.clone()
 
-        if self.cpu_offload:
+        if self.offload_aux_components:
             self.clip.model.to(self.device)
         clip_context = self.clip.visual(cond_image_tensor[:, :, -1:, :, :]).to(
             self.param_dtype
         )
-        if self.cpu_offload:
+        if self.offload_aux_components:
             self.clip.model.cpu()
             torch.cuda.empty_cache()
         video_frames = torch.zeros(
@@ -337,7 +348,7 @@ class FlashTalkPipeline:
         padding_frames_pixels_values = torch.concat(
             [cond_image_tensor, video_frames], dim=2
         )
-        if self.cpu_offload:
+        if self.offload_aux_components:
             self.vae.model.to(self.device)
             self.vae.scale[0] = self.vae.scale[0].to(self.device)
             self.vae.scale[1] = self.vae.scale[1].to(self.device)
@@ -400,7 +411,7 @@ class FlashTalkPipeline:
         self.base_latent_motion_frames = self.latent_motion_frames.clone()
         self.window_anchor_cache = {}
 
-        if self.cpu_offload:
+        if self.offload_aux_components:
             self.vae.model.cpu()
             torch.cuda.empty_cache()
 
@@ -418,13 +429,13 @@ class FlashTalkPipeline:
         audio_feature = audio_feature.unsqueeze(0)
 
         # audio encoder
-        if self.cpu_offload:
+        if self.offload_aux_components:
             self.audio_encoder.to(self.device)
         with torch.no_grad():
             embeddings = self.audio_encoder(
                 audio_feature, seq_len=int(video_length), output_hidden_states=True
             )
-        if self.cpu_offload:
+        if self.offload_aux_components:
             self.audio_encoder.cpu()
             torch.cuda.empty_cache()
 
@@ -525,7 +536,7 @@ class FlashTalkPipeline:
 
             # self.offload_dit_model()
 
-            if self.cpu_offload:
+            if self.offload_aux_components:
                 self.vae.model.to(self.device)
                 self.vae.scale[0] = self.vae.scale[0].to(self.device)
                 self.vae.scale[1] = self.vae.scale[1].to(self.device)
@@ -548,7 +559,9 @@ class FlashTalkPipeline:
 
         anchor_frames = max(int(self.motion_frames_num), int(self.decoded_anchor_frames))
         anchor_frames = min(anchor_frames, int(videos.shape[2]))
-        cond_frame = videos[:, :, -anchor_frames:].to(self.device)
+        cond_frame = videos[:, :, -anchor_frames:]
+        if cond_frame.device != torch.device(self.device):
+            cond_frame = cond_frame.to(self.device)
         torch.cuda.synchronize()
         end_color_correction_time = time.time()
         logger.info(
@@ -568,7 +581,7 @@ class FlashTalkPipeline:
         )
         self._update_latent_carryover_cache(latent)
 
-        if self.cpu_offload:
+        if self.offload_aux_components:
             self.vae.model.cpu()
             torch.cuda.empty_cache()
 
@@ -1398,7 +1411,6 @@ class FlashTalkPipeline:
 
                 # inference
                 video = self.generate_chunk(audio_embedding_chunk)
-                video = video.cpu()
                 drift_score = 0.0
 
                 if chunk_idx == 0:
@@ -1504,7 +1516,6 @@ class FlashTalkPipeline:
                 )
 
                 generated_list.append(video)
-                torch.cuda.empty_cache()
 
         elif audio_encode_mode == "stream":
             cached_audio_length_sum = sample_rate * cached_audio_duration
@@ -1584,7 +1595,6 @@ class FlashTalkPipeline:
 
                 # inference
                 video = self.generate_chunk(audio_embedding)
-                video = video.cpu()
                 drift_score = 0.0
 
                 if chunk_idx == 0:
@@ -1690,7 +1700,6 @@ class FlashTalkPipeline:
                 )
 
                 generated_list.append(video)
-                torch.cuda.empty_cache()
 
         # offload dit model
         if self.vram_management:
@@ -1723,7 +1732,7 @@ class FlashTalkPipeline:
             self.last_generation_debug["summary"]["crossfade_count"],
             self.last_generation_debug["summary"]["total_output_frames"],
         )
-        video_array = torch.cat(generated_list, dim=0).numpy().astype(np.uint8)
+        video_array = torch.cat(generated_list, dim=0).cpu().numpy().astype(np.uint8)
         video = Video(data=video_array, prompt=input_prompt, fps=tgt_fps)
         generate_end_time = time.perf_counter()
         logger.info(

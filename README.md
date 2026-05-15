@@ -91,6 +91,7 @@ video = pipeline.generate(
 | `checkpoint_dir` | `str` | 必填 | FlashTalk 模型权重根目录 |
 | `wav2vec_dir` | `str` | 必填 | Wav2Vec2 模型本地目录 |
 | `num_persistent_param_in_dit` | `int` | `10_000_000_000` | 常驻 GPU 的 DiT 参数个数上限，显存紧张时适当调小 |
+| `keep_aux_components_on_gpu` | `bool` | `False` | 让 T5、CLIP、VAE、audio encoder 常驻 GPU；适合测试更少 offload 的配置 |
 
 ### `generate` 主要参数
 

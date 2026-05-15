@@ -2,8 +2,8 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import logging
 import math
-from functools import lru_cache
 import time
+from collections import OrderedDict
 
 import torch
 import torch.nn as nn
@@ -552,6 +552,7 @@ class T5EncoderModel:
         model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"))
         self.model = model
         self.model.eval().requires_grad_(False)
+        self._context_cache = OrderedDict()
         if shard_fn is not None:
             self.model = shard_fn(self.model, sync_module_states=False)
         else:
@@ -561,17 +562,37 @@ class T5EncoderModel:
             name=tokenizer_path, seq_len=text_len, clean="whitespace"
         )
 
-    @lru_cache(maxsize=20)
-    def __call__(self, text, device):
+    def __call__(self, text, device, offload_to_cpu: bool = True):
         start_time = time.time()
+        cache_key = text if offload_to_cpu else None
+        if cache_key is not None and cache_key in self._context_cache:
+            context = self._context_cache[cache_key]
+            model_device = next(self.model.parameters()).device
+            if model_device.type != "cpu":
+                self.model.to("cpu")
+            end_time = time.time()
+            logger.info(f"T5 encode time: {end_time - start_time} seconds")
+            return context
+
         ids, mask = self.tokenizer([text], return_mask=True, add_special_tokens=True)
         ids = ids.to(device)
         mask = mask.to(device)
-        self.model.to(device)
+        model_device = next(self.model.parameters()).device
+        if model_device != torch.device(device):
+            self.model.to(device)
         seq_lens = mask.gt(0).sum(dim=1).long()
-        context = self.model(ids, mask).cpu()
-        self.model.to("cpu")
-        torch.cuda.empty_cache()
+        context = self.model(ids, mask)
+        if offload_to_cpu:
+            context = context.cpu()
+            self.model.to("cpu")
+            torch.cuda.empty_cache()
+            cached_context = [u[:v] for u, v in zip(context, seq_lens)]
+            self._context_cache[cache_key] = cached_context
+            while len(self._context_cache) > 20:
+                self._context_cache.popitem(last=False)
+            end_time = time.time()
+            logger.info(f"T5 encode time: {end_time - start_time} seconds")
+            return cached_context
         end_time = time.time()
         logger.info(f"T5 encode time: {end_time - start_time} seconds")
         return [u[:v] for u, v in zip(context, seq_lens)]
