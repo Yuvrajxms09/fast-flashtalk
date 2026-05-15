@@ -1,8 +1,10 @@
 import math
+import os
 import torch
 from torch import amp
 import torch.nn as nn
 import torch.nn.functional as F
+from loguru import logger
 
 from einops import rearrange
 from diffusers import ModelMixin
@@ -10,9 +12,17 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 
 from ..layers.rope import VideoRopePosition3DEmb
 from ..layers.attention import SingleStreamMutiAttention
+from ..kernels.fused_ops import (
+    fused_affine,
+    fused_residual_add,
+    fused_residual_mul_add,
+)
 from ..kernels.rope import fast_rope_apply, sinusoidal_embedding_1d
 from ..kernels.attn import attention
 from ..utils import get_attn_map_with_target
+
+
+ENABLE_FUSED_OP_LOGS = os.environ.get("ENABLE_FUSED_OP_LOGS", "0") == "1"
 
 
 class WanRMSNorm(nn.Module):
@@ -68,21 +78,46 @@ class WanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
+    def fuse_qkv(self):
+        if hasattr(self, "qkv"):
+            return
+
+        qkv = nn.Linear(self.dim, self.dim * 3, bias=self.q.bias is not None).to(
+            device=self.q.weight.device, dtype=self.q.weight.dtype
+        )
+        with torch.no_grad():
+            qkv.weight[: self.dim].copy_(self.q.weight)
+            qkv.weight[self.dim : 2 * self.dim].copy_(self.k.weight)
+            qkv.weight[2 * self.dim :].copy_(self.v.weight)
+            if qkv.bias is not None:
+                qkv.bias[: self.dim].copy_(self.q.bias)
+                qkv.bias[self.dim : 2 * self.dim].copy_(self.k.bias)
+                qkv.bias[2 * self.dim :].copy_(self.v.bias)
+        self.qkv = qkv
+        del self.q
+        del self.k
+        del self.v
+
     def forward(self, x, seq_lens, grid_sizes, freqs, ref_target_masks=None):
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+        orig_dtype = x.dtype
 
         # query, key, value function
-        def qkv_fn(x):
-            q = self.norm_q(self.q(x)).view(b, s, n, d)
-            k = self.norm_k(self.k(x)).view(b, s, n, d)
-            v = self.v(x).view(b, s, n, d)
-            return q, k, v
-
-        q, k, v = qkv_fn(x)
+        if hasattr(self, "qkv"):
+            q, k, v = self.qkv(x).chunk(3, dim=-1)
+        else:
+            q = self.q(x)
+            k = self.k(x)
+            v = self.v(x)
+        q = self.norm_q(q).reshape(b, s, n, d)
+        k = self.norm_k(k).reshape(b, s, n, d)
+        v = v.reshape(b, s, n, d)
         q = fast_rope_apply(q, freqs)
         k = fast_rope_apply(k, freqs)
 
-        x = attention(q=q, k=k, v=v).type_as(x)
+        x = attention(q=q, k=k, v=v)
+        if x.dtype != orig_dtype:
+            x = x.to(dtype=orig_dtype)
 
         # output
         x = x.flatten(2)
@@ -91,8 +126,8 @@ class WanSelfAttention(nn.Module):
         if ref_target_masks is not None:
             with torch.no_grad():
                 x_ref_attn_map = get_attn_map_with_target(
-                    q.type_as(x),
-                    k.type_as(x),
+                    q,
+                    k,
                     grid_sizes[0],
                     ref_target_masks=ref_target_masks,
                 )
@@ -109,6 +144,66 @@ class WanI2VCrossAttention(WanSelfAttention):
         self.k_img = nn.Linear(dim, dim)
         self.v_img = nn.Linear(dim, dim)
         self.norm_k_img = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        self._kv_img_cache = None
+
+    def clear_runtime_cache(self):
+        super().clear_runtime_cache()
+        self._kv_img_cache = None
+
+    def _get_cached_image_kv(self, context_img: torch.Tensor):
+        cache_key = (
+            context_img.data_ptr(),
+            tuple(context_img.shape),
+            context_img.device.type,
+            context_img.device.index,
+            context_img.dtype,
+        )
+        if self._kv_img_cache is not None:
+            cached_key, cached_k_img, cached_v_img = self._kv_img_cache
+            if cached_key == cache_key:
+                return cached_k_img, cached_v_img
+
+        k_img = self.k_img(context_img)
+        v_img = self.v_img(context_img)
+        if self.qk_norm:
+            k_img = self.norm_k_img(k_img)
+
+        self._kv_img_cache = (cache_key, k_img, v_img)
+        return k_img, v_img
+
+    def fuse_image_kv(self):
+        if hasattr(self, "kv_img"):
+            return
+
+        kv_img = nn.Linear(self.dim, self.dim * 2, bias=self.k_img.bias is not None).to(
+            device=self.k_img.weight.device, dtype=self.k_img.weight.dtype
+        )
+        with torch.no_grad():
+            kv_img.weight[: self.dim].copy_(self.k_img.weight)
+            kv_img.weight[self.dim :].copy_(self.v_img.weight)
+            if kv_img.bias is not None:
+                kv_img.bias[: self.dim].copy_(self.k_img.bias)
+                kv_img.bias[self.dim :].copy_(self.v_img.bias)
+        self.kv_img = kv_img
+        del self.k_img
+        del self.v_img
+
+    def fuse_context_kv(self):
+        if hasattr(self, "kv"):
+            return
+
+        kv = nn.Linear(self.dim, self.dim * 2, bias=self.k.bias is not None).to(
+            device=self.k.weight.device, dtype=self.k.weight.dtype
+        )
+        with torch.no_grad():
+            kv.weight[: self.dim].copy_(self.k.weight)
+            kv.weight[self.dim :].copy_(self.v.weight)
+            if kv.bias is not None:
+                kv.bias[: self.dim].copy_(self.k.bias)
+                kv.bias[self.dim :].copy_(self.v.bias)
+        self.kv = kv
+        del self.k
+        del self.v
 
     def forward(self, x, context, context_lens):
         context_img = context[:, :257]
@@ -116,11 +211,13 @@ class WanI2VCrossAttention(WanSelfAttention):
         b, n, d = x.size(0), self.num_heads, self.head_dim
 
         # compute query, key, value
-        q = self.norm_q(self.q(x)).view(b, -1, n, d)
-        k = self.norm_k(self.k(context)).view(b, -1, n, d)
-        v = self.v(context).view(b, -1, n, d)
-        k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
-        v_img = self.v_img(context_img).view(b, -1, n, d)
+        q = self.norm_q(self.q(x)).reshape(b, -1, n, d)
+        k, v = self._get_cached_kv(context)
+        k = k.reshape(b, -1, n, d)
+        v = v.reshape(b, -1, n, d)
+        k_img, v_img = self._get_cached_image_kv(context_img)
+        k_img = k_img.reshape(b, -1, n, d)
+        v_img = v_img.reshape(b, -1, n, d)
         img_x = attention(q, k_img, v_img)
         # compute attention
         x = attention(q, k, v)
@@ -217,19 +314,21 @@ class WanAttentionBlock(nn.Module):
 
         # self-attention
         y, x_ref_attn_map = self.self_attn(
-            (self.norm1(x).float() * (1 + e[1]) + e[0]).type_as(x),
+            fused_affine(self.norm1(x), 1 + e[1], e[0]),
             seq_lens,
             grid_sizes,
             freqs,
             ref_target_masks=ref_target_masks,
         )
-        with amp.autocast("cuda", dtype=torch.float32):
-            x = x + y * e[2]
+        x = fused_residual_mul_add(x, y, e[2])
 
         x = x.to(dtype)
 
         # cross-attention of text
-        x = x + self.cross_attn(self.norm3(x), context, context_lens)
+        x = fused_residual_add(
+            x,
+            self.cross_attn(self.norm3(x), context, context_lens),
+        )
 
         # cross attn of audio
         x_a = self.audio_cross_attn(
@@ -239,11 +338,10 @@ class WanAttentionBlock(nn.Module):
             x_ref_attn_map=x_ref_attn_map,
             human_num=human_num,
         )
-        x = x + x_a
+        x = fused_residual_add(x, x_a)
 
-        y = self.ffn((self.norm2(x).float() * (1 + e[4]) + e[3]).to(dtype))
-        with amp.autocast("cuda", dtype=torch.float32):
-            x = x + y * e[5]
+        y = self.ffn(fused_affine(self.norm2(x), 1 + e[4], e[3]))
+        x = fused_residual_mul_add(x, y, e[5])
 
         x = x.to(dtype)
 
@@ -275,7 +373,7 @@ class Head(nn.Module):
         assert e.dtype == torch.float32
         with amp.autocast("cuda", dtype=torch.float32):
             e = (self.modulation.to(e.device) + e.unsqueeze(1)).chunk(2, dim=1)
-            x = self.head(self.norm(x) * (1 + e[1]) + e[0])
+            x = self.head(fused_affine(self.norm(x), 1 + e[1], e[0]))
         return x
 
 
@@ -493,6 +591,7 @@ class WanModel(ModelMixin, ConfigMixin):
         )
         self._freqs_cache = {}
         self._audio_context_cache = None
+        self._time_context_cache = {}
 
         # initialize weights
         if weight_init:
@@ -564,6 +663,37 @@ class WanModel(ModelMixin, ConfigMixin):
         self._audio_context_cache = (cache_key, audio_embedding, human_num)
         return audio_embedding, human_num
 
+    def _get_time_context(self, t: torch.Tensor):
+        cache_key = (t.data_ptr(), t.device.type, t.device.index)
+        cached = self._time_context_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        with amp.autocast("cuda", dtype=torch.float32):
+            e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t).float())
+            e0 = self.time_projection(e).unflatten(1, (6, self.dim))
+        self._time_context_cache[cache_key] = (e, e0)
+        return e, e0
+
+    def fuse_attention_projections(self):
+        for block in self.blocks:
+            block.self_attn.fuse_qkv()
+            block.cross_attn.fuse_context_kv()
+            block.cross_attn.fuse_image_kv()
+        if ENABLE_FUSED_OP_LOGS:
+            logger.info(
+                "Fused attention projections across {} Wan blocks",
+                len(self.blocks),
+            )
+
+    def clear_runtime_caches(self):
+        for block in self.blocks:
+            block.self_attn.clear_runtime_cache()
+            block.cross_attn.clear_runtime_cache()
+            block.audio_cross_attn.clear_runtime_cache()
+        if ENABLE_FUSED_OP_LOGS:
+            logger.info("Cleared Wan runtime caches before forward pass")
+
     def forward(
         self,
         x,
@@ -576,6 +706,8 @@ class WanModel(ModelMixin, ConfigMixin):
         ref_target_masks=None,
     ):
         assert clip_fea is not None and y is not None
+
+        self.clear_runtime_caches()
 
         # params
         # device = self.patch_embedding.weight.device
@@ -611,10 +743,8 @@ class WanModel(ModelMixin, ConfigMixin):
         )
 
         # time embeddings
-        with amp.autocast("cuda", dtype=torch.float32):
-            e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t).float())
-            e0 = self.time_projection(e).unflatten(1, (6, self.dim))
-            assert e.dtype == torch.float32 and e0.dtype == torch.float32
+        e, e0 = self._get_time_context(t)
+        assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
         # text embedding
         context_lens = None
@@ -669,6 +799,17 @@ class WanModel(ModelMixin, ConfigMixin):
 
         # unpatchify
         x = self.unpatchify(x, grid_sizes)
+
+        if ENABLE_FUSED_OP_LOGS:
+            fused_self_attn = sum(hasattr(block.self_attn, "qkv") for block in self.blocks)
+            fused_context_kv = sum(hasattr(block.cross_attn, "kv") for block in self.blocks)
+            fused_image_kv = sum(hasattr(block.cross_attn, "kv_img") for block in self.blocks)
+            logger.info(
+                "Wan runtime summary: fused_self_attn={}, fused_context_kv={}, fused_image_kv={}",
+                fused_self_attn,
+                fused_context_kv,
+                fused_image_kv,
+            )
 
         return torch.stack(x).float()
 

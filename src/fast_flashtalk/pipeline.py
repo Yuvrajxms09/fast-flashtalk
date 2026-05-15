@@ -169,6 +169,8 @@ class FlashTalkPipeline:
             torch_dtype=self.param_dtype,
         )
         self.model.eval().requires_grad_(False)
+        if not self.quantize_weights and hasattr(self.model, "fuse_attention_projections"):
+            self.model.fuse_attention_projections()
         if self.quantize_weights:
             if self.weight_bits == 8:
                 quantize_model_a8w8_int8_gemlite(self.model, device="cuda")
@@ -399,6 +401,10 @@ class FlashTalkPipeline:
                 for t in timesteps
             ]
         self.timesteps = timesteps
+        if hasattr(self.model, "_time_context_cache"):
+            self.model._time_context_cache = {}
+        if hasattr(self.model, "_audio_context_cache"):
+            self.model._audio_context_cache = None
 
         self.arg_c = {
             "context": [context],

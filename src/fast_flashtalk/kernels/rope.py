@@ -35,18 +35,20 @@ def fast_rope_apply(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
         Tensor: Rotary-embedded tensor with same shape as input
     """
     batch_size, seq_len, n_heads, head_dim = x.shape
+    orig_dtype = x.dtype
 
     # freqs is already sharded to local seq_len under flattened CP
     freqs = freqs.view(seq_len, head_dim // 2)
-    cos = torch.cos(freqs).to(torch.float32)
-    sin = torch.sin(freqs).to(torch.float32)
+    freqs_dtype = x.dtype if x.dtype in (torch.float16, torch.bfloat16) else torch.float32
+    cos = torch.cos(freqs).to(freqs_dtype)
+    sin = torch.sin(freqs).to(freqs_dtype)
 
     # Apply the rotation
-    rotated = apply_rotary_emb(
-        x.to(torch.float32), cos, sin, interleaved=True, inplace=False
-    )
+    if x.dtype not in (torch.float16, torch.bfloat16):
+        x = x.to(torch.float32)
+    rotated = apply_rotary_emb(x, cos, sin, interleaved=True, inplace=False)
 
-    return rotated.to(x.dtype)
+    return rotated.to(orig_dtype) if rotated.dtype != orig_dtype else rotated
 
 
 def rotate_half(x, interleaved=False):

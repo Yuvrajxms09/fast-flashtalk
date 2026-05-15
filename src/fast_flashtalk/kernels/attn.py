@@ -23,16 +23,15 @@ def attention(
     assert q.device.type == "cuda" and q.size(-1) <= 256
     _B, L_k, _N_k, _D = k.shape
 
-    def half(x):
-        return x if x.dtype in half_dtypes else x.to(dtype)
+    target_dtype = v.dtype if v.dtype in half_dtypes else dtype
 
-    # Convert to half precision if needed
-    q = half(q)
-    k = half(k)
-    v = half(v)
+    if q.dtype != target_dtype:
+        q = q.to(target_dtype)
+    if k.dtype != target_dtype:
+        k = k.to(target_dtype)
+    if v.dtype != target_dtype:
+        v = v.to(target_dtype)
 
-    q = q.to(v.dtype)
-    k = k.to(v.dtype)
     if L_k < 512:
         with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
             return scaled_dot_product_attention(
