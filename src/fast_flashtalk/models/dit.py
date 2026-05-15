@@ -179,8 +179,12 @@ class WanI2VCrossAttention(WanSelfAttention):
             if cached_key == cache_key:
                 return cached_k_img, cached_v_img
 
-        k_img = self.k_img(context_img)
-        v_img = self.v_img(context_img)
+        if hasattr(self, "kv_img"):
+            context_img_kv = self.kv_img(context_img)
+            k_img, v_img = context_img_kv.chunk(2, dim=-1)
+        else:
+            k_img = self.k_img(context_img)
+            v_img = self.v_img(context_img)
         if self.qk_norm:
             k_img = self.norm_k_img(k_img)
 
@@ -234,7 +238,7 @@ class WanI2VCrossAttention(WanSelfAttention):
             context_kv = self.kv_linear(context)
         k, v = context_kv.chunk(2, dim=-1)
         if self.qk_norm:
-            k = self.add_k_norm(k)
+            k = self.norm_k(k)
         k = k.reshape(b, -1, n, d)
         v = v.reshape(b, -1, n, d)
         k_img, v_img = self._get_cached_image_kv(context_img)
