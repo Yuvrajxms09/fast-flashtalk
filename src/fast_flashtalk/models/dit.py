@@ -19,7 +19,7 @@ from ..kernels.fused_ops import (
     fused_residual_mul_add,
     fused_rms_norm,
 )
-from ..kernels.rope import fast_rope_apply, sinusoidal_embedding_1d
+from ..kernels.rope import fast_rope_apply, fast_rope_apply_qkv, sinusoidal_embedding_1d
 from ..kernels.attn import attention
 from ..utils import get_attn_map_with_target
 
@@ -91,6 +91,8 @@ class WanSelfAttention(nn.Module):
         self.o = nn.Linear(dim, dim)
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        self._qkv_rope_logged = False
+        self._qkv_rope_calls = 0
 
     def fuse_qkv(self):
         if hasattr(self, "qkv"):
@@ -121,16 +123,31 @@ class WanSelfAttention(nn.Module):
 
         # query, key, value function
         if hasattr(self, "qkv"):
-            q, k, v = self.qkv(x).chunk(3, dim=-1)
+            if ENABLE_FUSED_OP_LOGS and not self._qkv_rope_logged:
+                logger.info(
+                    "WanSelfAttention using fused qkv RoPE path for dim={} heads={} head_dim={}",
+                    self.dim,
+                    self.num_heads,
+                    self.head_dim,
+                )
+                self._qkv_rope_logged = True
+            qkv = self.qkv(x).view(b, s, 3, n, d)
+            qkv[:, :, 0] = self.norm_q(qkv[:, :, 0])
+            qkv[:, :, 1] = self.norm_k(qkv[:, :, 1])
+            qkv = fast_rope_apply_qkv(qkv, freqs)
+            q, k, v = qkv.unbind(dim=2)
+            q = q.reshape(b, s, n, d)
+            k = k.reshape(b, s, n, d)
+            self._qkv_rope_calls += 1
         else:
             q = self.q(x)
             k = self.k(x)
             v = self.v(x)
-        q = self.norm_q(q).reshape(b, s, n, d)
-        k = self.norm_k(k).reshape(b, s, n, d)
+            q = self.norm_q(q).reshape(b, s, n, d)
+            k = self.norm_k(k).reshape(b, s, n, d)
+            q = fast_rope_apply(q, freqs)
+            k = fast_rope_apply(k, freqs)
         v = v.reshape(b, s, n, d)
-        q = fast_rope_apply(q, freqs)
-        k = fast_rope_apply(k, freqs)
 
         x = attention(q=q, k=k, v=v)
         if x.dtype != orig_dtype:
@@ -161,36 +178,9 @@ class WanI2VCrossAttention(WanSelfAttention):
         self.k_img = nn.Linear(dim, dim)
         self.v_img = nn.Linear(dim, dim)
         self.norm_k_img = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
-        self._kv_img_cache = None
 
     def clear_runtime_cache(self):
         super().clear_runtime_cache()
-        self._kv_img_cache = None
-
-    def _get_cached_image_kv(self, context_img: torch.Tensor):
-        cache_key = (
-            context_img.data_ptr(),
-            tuple(context_img.shape),
-            context_img.device.type,
-            context_img.device.index,
-            context_img.dtype,
-        )
-        if self._kv_img_cache is not None:
-            cached_key, cached_k_img, cached_v_img = self._kv_img_cache
-            if cached_key == cache_key:
-                return cached_k_img, cached_v_img
-
-        if hasattr(self, "kv_img"):
-            context_img_kv = self.kv_img(context_img)
-            k_img, v_img = context_img_kv.chunk(2, dim=-1)
-        else:
-            k_img = self.k_img(context_img)
-            v_img = self.v_img(context_img)
-        if self.qk_norm:
-            k_img = self.norm_k_img(k_img)
-
-        self._kv_img_cache = (cache_key, k_img, v_img)
-        return k_img, v_img
 
     def fuse_image_kv(self):
         if hasattr(self, "kv_img"):
@@ -242,7 +232,14 @@ class WanI2VCrossAttention(WanSelfAttention):
             k = self.norm_k(k)
         k = k.reshape(b, -1, n, d)
         v = v.reshape(b, -1, n, d)
-        k_img, v_img = self._get_cached_image_kv(context_img)
+        if hasattr(self, "kv_img"):
+            context_img_kv = self.kv_img(context_img)
+            k_img, v_img = context_img_kv.chunk(2, dim=-1)
+        else:
+            k_img = self.k_img(context_img)
+            v_img = self.v_img(context_img)
+        if self.qk_norm:
+            k_img = self.norm_k_img(k_img)
         k_img = k_img.reshape(b, -1, n, d)
         v_img = v_img.reshape(b, -1, n, d)
         img_x = attention(q, k_img, v_img)
@@ -874,6 +871,9 @@ class WanModel(ModelMixin, ConfigMixin):
             fused_self_attn = sum(hasattr(block.self_attn, "qkv") for block in self.blocks)
             fused_context_kv = sum(hasattr(block.cross_attn, "kv") for block in self.blocks)
             fused_image_kv = sum(hasattr(block.cross_attn, "kv_img") for block in self.blocks)
+            fused_qkv_rope_calls = sum(
+                getattr(block.self_attn, "_qkv_rope_calls", 0) for block in self.blocks
+            )
             fused_ffn_calls = sum(
                 getattr(module, "_triton_calls", 0)
                 for module in self.modules()
@@ -885,10 +885,11 @@ class WanModel(ModelMixin, ConfigMixin):
                 if isinstance(module, WanRMSNorm)
             )
             logger.info(
-                "Wan runtime summary: fused_self_attn={}, fused_context_kv={}, fused_image_kv={}, fused_ffn_calls={}, rmsnorm_triton_calls={}",
+                "Wan runtime summary: fused_self_attn={}, fused_context_kv={}, fused_image_kv={}, fused_qkv_rope_calls={}, fused_ffn_calls={}, rmsnorm_triton_calls={}",
                 fused_self_attn,
                 fused_context_kv,
                 fused_image_kv,
+                fused_qkv_rope_calls,
                 fused_ffn_calls,
                 rmsnorm_triton_calls,
             )

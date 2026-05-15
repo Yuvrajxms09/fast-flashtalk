@@ -8,6 +8,30 @@ import triton.language as tl
 from einops import rearrange
 
 
+_ROPE_COS_SIN_CACHE = {}
+
+
+def _get_cached_cos_sin(freqs: torch.Tensor):
+    cache_key = (
+        freqs.data_ptr(),
+        tuple(freqs.shape),
+        freqs.device.type,
+        freqs.device.index,
+        freqs.dtype,
+    )
+    cached = _ROPE_COS_SIN_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    freqs_dtype = freqs.dtype if freqs.dtype in (torch.float16, torch.bfloat16) else torch.float32
+    cos = torch.cos(freqs).to(freqs_dtype)
+    sin = torch.sin(freqs).to(freqs_dtype)
+    if len(_ROPE_COS_SIN_CACHE) > 32:
+        _ROPE_COS_SIN_CACHE.clear()
+    _ROPE_COS_SIN_CACHE[cache_key] = (cos, sin)
+    return cos, sin
+
+
 def sinusoidal_embedding_1d(dim, position):
     # preprocess
     assert dim % 2 == 0
@@ -39,9 +63,7 @@ def fast_rope_apply(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
 
     # freqs is already sharded to local seq_len under flattened CP
     freqs = freqs.view(seq_len, head_dim // 2)
-    freqs_dtype = x.dtype if x.dtype in (torch.float16, torch.bfloat16) else torch.float32
-    cos = torch.cos(freqs).to(freqs_dtype)
-    sin = torch.sin(freqs).to(freqs_dtype)
+    cos, sin = _get_cached_cos_sin(freqs)
 
     # Apply the rotation
     if x.dtype not in (torch.float16, torch.bfloat16):
@@ -49,6 +71,22 @@ def fast_rope_apply(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
     rotated = apply_rotary_emb(x, cos, sin, interleaved=True, inplace=False)
 
     return rotated.to(orig_dtype) if rotated.dtype != orig_dtype else rotated
+
+
+def fast_rope_apply_qkv(qkv: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+    if not qkv.is_cuda or qkv.dim() != 5:
+        q = fast_rope_apply(qkv[:, :, 0], freqs)
+        k = fast_rope_apply(qkv[:, :, 1], freqs)
+        return torch.stack([q, k, qkv[:, :, 2]], dim=2)
+
+    batch_size, seq_len, three, n_heads, head_dim = qkv.shape
+    if three != 3:
+        raise ValueError(f"expected qkv to have 3 projections, got shape={tuple(qkv.shape)}")
+
+    freqs = freqs.view(seq_len, head_dim // 2)
+    cos, sin = _get_cached_cos_sin(freqs)
+    qkv = apply_rotary_emb_qkv_(qkv, cos, sin, interleaved=True)
+    return qkv
 
 
 def rotate_half(x, interleaved=False):
