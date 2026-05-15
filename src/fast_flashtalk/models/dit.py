@@ -160,38 +160,11 @@ class WanI2VCrossAttention(WanSelfAttention):
         self.k_img = nn.Linear(dim, dim)
         self.v_img = nn.Linear(dim, dim)
         self.norm_k_img = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
-        self._kv_cache = None
         self._kv_img_cache = None
 
     def clear_runtime_cache(self):
         super().clear_runtime_cache()
-        self._kv_cache = None
         self._kv_img_cache = None
-
-    def _get_cached_kv(self, context: torch.Tensor):
-        cache_key = (
-            context.data_ptr(),
-            tuple(context.shape),
-            context.device.type,
-            context.device.index,
-            context.dtype,
-        )
-        if self._kv_cache is not None:
-            cached_key, cached_k, cached_v = self._kv_cache
-            if cached_key == cache_key:
-                return cached_k, cached_v
-
-        if hasattr(self, "kv"):
-            context_kv = self.kv(context)
-        else:
-            context_kv = self.kv_linear(context)
-
-        k, v = context_kv.chunk(2, dim=-1)
-        if self.qk_norm:
-            k = self.add_k_norm(k)
-
-        self._kv_cache = (cache_key, k, v)
-        return k, v
 
     def _get_cached_image_kv(self, context_img: torch.Tensor):
         cache_key = (
@@ -255,7 +228,13 @@ class WanI2VCrossAttention(WanSelfAttention):
 
         # compute query, key, value
         q = self.norm_q(self.q(x)).reshape(b, -1, n, d)
-        k, v = self._get_cached_kv(context)
+        if hasattr(self, "kv"):
+            context_kv = self.kv(context)
+        else:
+            context_kv = self.kv_linear(context)
+        k, v = context_kv.chunk(2, dim=-1)
+        if self.qk_norm:
+            k = self.add_k_norm(k)
         k = k.reshape(b, -1, n, d)
         v = v.reshape(b, -1, n, d)
         k_img, v_img = self._get_cached_image_kv(context_img)
