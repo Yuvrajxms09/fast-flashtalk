@@ -14,6 +14,7 @@ from ..layers.rope import VideoRopePosition3DEmb
 from ..layers.attention import SingleStreamMutiAttention
 from ..kernels.fused_ops import (
     fused_affine,
+    fused_ffn,
     fused_residual_add,
     fused_residual_mul_add,
     fused_rms_norm,
@@ -24,7 +25,6 @@ from ..utils import get_attn_map_with_target
 
 
 ENABLE_FUSED_OP_LOGS = os.environ.get("ENABLE_FUSED_OP_LOGS", "0") == "1"
-ENABLE_FFN_COMPILE = os.environ.get("ENABLE_FFN_COMPILE", "1") == "1"
 
 
 class WanRMSNorm(nn.Module):
@@ -261,44 +261,40 @@ class WanFeedForward(nn.Module):
     def __init__(self, dim, ffn_dim):
         super().__init__()
         self.fc1 = nn.Linear(dim, ffn_dim)
-        self.act = nn.GELU(approximate="tanh")
         self.fc2 = nn.Linear(ffn_dim, dim)
-        self._compiled = False
+        self._triton_logged = False
+        self._triton_calls = 0
+        self._fused_disabled = False
 
-        if ENABLE_FFN_COMPILE and hasattr(torch, "compile"):
-            try:
-                self._compiled_core = torch.compile(
-                    self._forward_impl,
-                    fullgraph=False,
-                    dynamic=False,
-                    mode="reduce-overhead",
-                )
-                self._compiled = True
-                if ENABLE_FUSED_OP_LOGS:
-                    logger.info(
-                        "Compiled Wan FFN with torch.compile for dim={} ffn_dim={}",
-                        dim,
-                        ffn_dim,
-                    )
-            except Exception as exc:
-                self._compiled_core = None
-                logger.warning(
-                    "Wan FFN compile failed; falling back to eager path. error={}",
-                    exc,
-                )
-        else:
-            self._compiled_core = None
-
-    def _forward_impl(self, x):
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.fc2(x)
-        return x
+    def clear_runtime_cache(self):
+        return
 
     def forward(self, x):
-        if self._compiled_core is not None:
-            return self._compiled_core(x)
-        return self._forward_impl(x)
+        if x.is_cuda and x.dim() == 3 and not self._fused_disabled:
+            if ENABLE_FUSED_OP_LOGS and not self._triton_logged:
+                logger.info(
+                    "WanFeedForward using Triton fused FFN path for in_dim={} hidden_dim={} dtype={}",
+                    self.fc1.in_features,
+                    self.fc1.out_features,
+                    x.dtype,
+                )
+                self._triton_logged = True
+            self._triton_calls += 1
+            try:
+                return fused_ffn(
+                    x,
+                    self.fc1.weight,
+                    self.fc1.bias,
+                    self.fc2.weight,
+                    self.fc2.bias,
+                )
+            except Exception as exc:
+                self._fused_disabled = True
+                logger.warning(
+                    "WanFeedForward Triton path failed; falling back to eager FFN. error={}",
+                    exc,
+                )
+        return self.fc2(F.gelu(self.fc1(x), approximate="tanh"))
 
 
 class WanAttentionBlock(nn.Module):
@@ -762,6 +758,9 @@ class WanModel(ModelMixin, ConfigMixin):
             if isinstance(module, WanRMSNorm):
                 module._triton_calls = 0
                 module._triton_logged = False
+            if isinstance(module, WanFeedForward):
+                module._triton_calls = 0
+                module._triton_logged = False
         if ENABLE_FUSED_OP_LOGS:
             logger.info("Cleared Wan runtime caches before forward pass")
 
@@ -875,8 +874,10 @@ class WanModel(ModelMixin, ConfigMixin):
             fused_self_attn = sum(hasattr(block.self_attn, "qkv") for block in self.blocks)
             fused_context_kv = sum(hasattr(block.cross_attn, "kv") for block in self.blocks)
             fused_image_kv = sum(hasattr(block.cross_attn, "kv_img") for block in self.blocks)
-            compiled_ffn_blocks = sum(
-                getattr(block.ffn, "_compiled", False) for block in self.blocks
+            fused_ffn_calls = sum(
+                getattr(block.ffn, "_triton_calls", 0)
+                for block in self.blocks
+                if isinstance(block.ffn, WanFeedForward)
             )
             rmsnorm_triton_calls = sum(
                 getattr(module, "_triton_calls", 0)
@@ -884,11 +885,11 @@ class WanModel(ModelMixin, ConfigMixin):
                 if isinstance(module, WanRMSNorm)
             )
             logger.info(
-                "Wan runtime summary: fused_self_attn={}, fused_context_kv={}, fused_image_kv={}, compiled_ffn_blocks={}, rmsnorm_triton_calls={}",
+                "Wan runtime summary: fused_self_attn={}, fused_context_kv={}, fused_image_kv={}, fused_ffn_calls={}, rmsnorm_triton_calls={}",
                 fused_self_attn,
                 fused_context_kv,
                 fused_image_kv,
-                compiled_ffn_blocks,
+                fused_ffn_calls,
                 rmsnorm_triton_calls,
             )
 
