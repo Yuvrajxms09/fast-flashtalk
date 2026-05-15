@@ -260,14 +260,23 @@ class WanFeedForward(nn.Module):
         self.in_dim = in_dim
         self.hidden_dim = hidden_dim
         self.out_dim = in_dim if out_dim is None else out_dim
-        self.fc1 = nn.Linear(in_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, self.out_dim)
+        self.add_module("0", nn.Linear(in_dim, hidden_dim))
+        self.add_module("1", nn.GELU(approximate="tanh"))
+        self.add_module("2", nn.Linear(hidden_dim, self.out_dim))
         self._triton_logged = False
         self._triton_calls = 0
         self._fused_disabled = False
 
     def clear_runtime_cache(self):
         return
+
+    @property
+    def fc1(self):
+        return getattr(self, "0")
+
+    @property
+    def fc2(self):
+        return getattr(self, "2")
 
     def forward(self, x):
         if x.is_cuda and x.dim() == 3 and not self._fused_disabled:
@@ -295,7 +304,7 @@ class WanFeedForward(nn.Module):
                     "WanFeedForward Triton path failed; falling back to eager FFN. error={}",
                     exc,
                 )
-        return self.fc2(F.gelu(self.fc1(x), approximate="tanh"))
+        return self.fc2(getattr(self, "1")(self.fc1(x)))
 
 
 class WanAttentionBlock(nn.Module):
@@ -445,13 +454,23 @@ class MLPProj(torch.nn.Module):
     def __init__(self, in_dim, out_dim):
         super().__init__()
 
-        self.norm_in = torch.nn.LayerNorm(in_dim)
-        self.proj = WanFeedForward(in_dim, in_dim, out_dim)
-        self.norm_out = torch.nn.LayerNorm(out_dim)
+        self.proj = nn.Sequential(
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, in_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(in_dim, out_dim),
+            nn.LayerNorm(out_dim),
+        )
 
     def forward(self, image_embeds):
-        clip_extra_context_tokens = self.norm_out(
-            self.proj(self.norm_in(image_embeds))
+        clip_extra_context_tokens = self.proj[4](
+            fused_ffn(
+                self.proj[0](image_embeds),
+                self.proj[1].weight,
+                self.proj[1].bias,
+                self.proj[3].weight,
+                self.proj[3].bias,
+            )
         )
         return clip_extra_context_tokens
 
