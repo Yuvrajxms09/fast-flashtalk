@@ -24,6 +24,7 @@ from ..utils import get_attn_map_with_target
 
 
 ENABLE_FUSED_OP_LOGS = os.environ.get("ENABLE_FUSED_OP_LOGS", "0") == "1"
+ENABLE_FFN_COMPILE = os.environ.get("ENABLE_FFN_COMPILE", "1") == "1"
 
 
 class WanRMSNorm(nn.Module):
@@ -256,6 +257,50 @@ class WanI2VCrossAttention(WanSelfAttention):
         return x
 
 
+class WanFeedForward(nn.Module):
+    def __init__(self, dim, ffn_dim):
+        super().__init__()
+        self.fc1 = nn.Linear(dim, ffn_dim)
+        self.act = nn.GELU(approximate="tanh")
+        self.fc2 = nn.Linear(ffn_dim, dim)
+        self._compiled = False
+
+        if ENABLE_FFN_COMPILE and hasattr(torch, "compile"):
+            try:
+                self._compiled_core = torch.compile(
+                    self._forward_impl,
+                    fullgraph=False,
+                    dynamic=False,
+                    mode="reduce-overhead",
+                )
+                self._compiled = True
+                if ENABLE_FUSED_OP_LOGS:
+                    logger.info(
+                        "Compiled Wan FFN with torch.compile for dim={} ffn_dim={}",
+                        dim,
+                        ffn_dim,
+                    )
+            except Exception as exc:
+                self._compiled_core = None
+                logger.warning(
+                    "Wan FFN compile failed; falling back to eager path. error={}",
+                    exc,
+                )
+        else:
+            self._compiled_core = None
+
+    def _forward_impl(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.fc2(x)
+        return x
+
+    def forward(self, x):
+        if self._compiled_core is not None:
+            return self._compiled_core(x)
+        return self._forward_impl(x)
+
+
 class WanAttentionBlock(nn.Module):
     def __init__(
         self,
@@ -291,11 +336,7 @@ class WanAttentionBlock(nn.Module):
         )
         self.cross_attn = WanI2VCrossAttention(dim, num_heads, (-1, -1), qk_norm, eps)
         self.norm2 = WanLayerNorm(dim, eps)
-        self.ffn = nn.Sequential(
-            nn.Linear(dim, ffn_dim),
-            nn.GELU(approximate="tanh"),
-            nn.Linear(ffn_dim, dim),
-        )
+        self.ffn = WanFeedForward(dim, ffn_dim)
 
         # modulation
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
@@ -834,16 +875,20 @@ class WanModel(ModelMixin, ConfigMixin):
             fused_self_attn = sum(hasattr(block.self_attn, "qkv") for block in self.blocks)
             fused_context_kv = sum(hasattr(block.cross_attn, "kv") for block in self.blocks)
             fused_image_kv = sum(hasattr(block.cross_attn, "kv_img") for block in self.blocks)
+            compiled_ffn_blocks = sum(
+                getattr(block.ffn, "_compiled", False) for block in self.blocks
+            )
             rmsnorm_triton_calls = sum(
                 getattr(module, "_triton_calls", 0)
                 for module in self.modules()
                 if isinstance(module, WanRMSNorm)
             )
             logger.info(
-                "Wan runtime summary: fused_self_attn={}, fused_context_kv={}, fused_image_kv={}, rmsnorm_triton_calls={}",
+                "Wan runtime summary: fused_self_attn={}, fused_context_kv={}, fused_image_kv={}, compiled_ffn_blocks={}, rmsnorm_triton_calls={}",
                 fused_self_attn,
                 fused_context_kv,
                 fused_image_kv,
+                compiled_ffn_blocks,
                 rmsnorm_triton_calls,
             )
 
