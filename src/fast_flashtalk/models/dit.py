@@ -258,10 +258,13 @@ class WanI2VCrossAttention(WanSelfAttention):
 
 
 class WanFeedForward(nn.Module):
-    def __init__(self, dim, ffn_dim):
+    def __init__(self, in_dim, hidden_dim, out_dim=None):
         super().__init__()
-        self.fc1 = nn.Linear(dim, ffn_dim)
-        self.fc2 = nn.Linear(ffn_dim, dim)
+        self.in_dim = in_dim
+        self.hidden_dim = hidden_dim
+        self.out_dim = in_dim if out_dim is None else out_dim
+        self.fc1 = nn.Linear(in_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, self.out_dim)
         self._triton_logged = False
         self._triton_calls = 0
         self._fused_disabled = False
@@ -274,20 +277,21 @@ class WanFeedForward(nn.Module):
             if ENABLE_FUSED_OP_LOGS and not self._triton_logged:
                 logger.info(
                     "WanFeedForward using Triton fused FFN path for in_dim={} hidden_dim={} dtype={}",
-                    self.fc1.in_features,
-                    self.fc1.out_features,
+                    self.in_dim,
+                    self.hidden_dim,
                     x.dtype,
                 )
                 self._triton_logged = True
-            self._triton_calls += 1
             try:
-                return fused_ffn(
+                out = fused_ffn(
                     x,
                     self.fc1.weight,
                     self.fc1.bias,
                     self.fc2.weight,
                     self.fc2.bias,
                 )
+                self._triton_calls += 1
+                return out
             except Exception as exc:
                 self._fused_disabled = True
                 logger.warning(
@@ -332,7 +336,7 @@ class WanAttentionBlock(nn.Module):
         )
         self.cross_attn = WanI2VCrossAttention(dim, num_heads, (-1, -1), qk_norm, eps)
         self.norm2 = WanLayerNorm(dim, eps)
-        self.ffn = WanFeedForward(dim, ffn_dim)
+        self.ffn = WanFeedForward(dim, ffn_dim, dim)
 
         # modulation
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
@@ -444,16 +448,14 @@ class MLPProj(torch.nn.Module):
     def __init__(self, in_dim, out_dim):
         super().__init__()
 
-        self.proj = torch.nn.Sequential(
-            torch.nn.LayerNorm(in_dim),
-            torch.nn.Linear(in_dim, in_dim),
-            torch.nn.GELU(),
-            torch.nn.Linear(in_dim, out_dim),
-            torch.nn.LayerNorm(out_dim),
-        )
+        self.norm_in = torch.nn.LayerNorm(in_dim)
+        self.proj = WanFeedForward(in_dim, in_dim, out_dim)
+        self.norm_out = torch.nn.LayerNorm(out_dim)
 
     def forward(self, image_embeds):
-        clip_extra_context_tokens = self.proj(image_embeds)
+        clip_extra_context_tokens = self.norm_out(
+            self.proj(self.norm_in(image_embeds))
+        )
         return clip_extra_context_tokens
 
 
@@ -600,9 +602,7 @@ class WanModel(ModelMixin, ConfigMixin):
         self.patch_embedding = nn.Conv3d(
             in_dim, dim, kernel_size=patch_size, stride=patch_size
         )
-        self.text_embedding = nn.Sequential(
-            nn.Linear(text_dim, dim), nn.GELU(approximate="tanh"), nn.Linear(dim, dim)
-        )
+        self.text_embedding = WanFeedForward(text_dim, dim, dim)
 
         self.time_embedding = nn.Sequential(
             nn.Linear(freq_dim, dim), nn.SiLU(), nn.Linear(dim, dim)
@@ -875,9 +875,9 @@ class WanModel(ModelMixin, ConfigMixin):
             fused_context_kv = sum(hasattr(block.cross_attn, "kv") for block in self.blocks)
             fused_image_kv = sum(hasattr(block.cross_attn, "kv_img") for block in self.blocks)
             fused_ffn_calls = sum(
-                getattr(block.ffn, "_triton_calls", 0)
-                for block in self.blocks
-                if isinstance(block.ffn, WanFeedForward)
+                getattr(module, "_triton_calls", 0)
+                for module in self.modules()
+                if isinstance(module, WanFeedForward)
             )
             rmsnorm_triton_calls = sum(
                 getattr(module, "_triton_calls", 0)

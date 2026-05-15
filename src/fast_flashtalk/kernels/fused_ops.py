@@ -458,9 +458,6 @@ def fused_ffn(
         raise ValueError(
             f"bias shapes {tuple(b1.shape)}, {tuple(b2.shape)} do not match weights"
         )
-    if out_dim != in_dim:
-        return F.gelu(x.matmul(w1.t()) + b1, approximate="tanh").matmul(w2.t()) + b2
-
     x2d = x.reshape(-1, in_dim)
     n_rows = x2d.shape[0]
     out = torch.empty((n_rows, out_dim), device=x.device, dtype=x.dtype)
@@ -503,4 +500,4 @@ def fused_ffn(
         OUT_DIM=out_dim,
         num_warps=4,
     )
-    return out.reshape_as(x)
+    return out.reshape(*x.shape[:-1], out_dim)
