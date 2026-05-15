@@ -131,13 +131,12 @@ class WanSelfAttention(nn.Module):
                     self.head_dim,
                 )
                 self._qkv_rope_logged = True
-            qkv = self.qkv(x).view(b, s, 3, n, d)
-            qkv[:, :, 0] = self.norm_q(qkv[:, :, 0])
-            qkv[:, :, 1] = self.norm_k(qkv[:, :, 1])
-            qkv = fast_rope_apply_qkv(qkv, freqs)
-            q, k, v = qkv.unbind(dim=2)
-            q = q.reshape(b, s, n, d)
-            k = k.reshape(b, s, n, d)
+            qkv = self.qkv(x).chunk(3, dim=-1)
+            q = self.norm_q(qkv[0]).view(b, s, n, d)
+            k = self.norm_k(qkv[1]).view(b, s, n, d)
+            v = qkv[2].view(b, s, n, d)
+            q = fast_rope_apply(q, freqs)
+            k = fast_rope_apply(k, freqs)
             self._qkv_rope_calls += 1
         else:
             q = self.q(x)
