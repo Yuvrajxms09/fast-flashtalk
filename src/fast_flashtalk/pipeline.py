@@ -27,6 +27,7 @@ from .utils import (
 )
 from .quantize import quantize_model_a8w8_int8_gemlite, quantize_model_a8w4_hqq_gemlite
 from .gemlite.core import GemLiteLinear
+from .nunchaku_backend import SVDQW4A4Linear, has_nunchaku_backend, load_nunchaku_export_into_module
 from .vram_management import (
     enable_vram_management,
     AutoWrappedLinear,
@@ -79,6 +80,9 @@ class FlashTalkPipeline:
         keep_dit_on_gpu=False,
         quantize_weights=True,
         weight_bits=8,
+        quant_backend="gemlite",
+        nunchaku_export_dir=None,
+        nunchaku_rank=1,
     ):
         """FlashTalkPipeline for RTX 4090 GPU.
         Args:
@@ -98,6 +102,11 @@ class FlashTalkPipeline:
                 management only.
             weight_bits (`int`, *optional*, defaults to 8):
                 DiT weight quantization bit-width. Supported values are 8 and 4.
+            quant_backend (`str`, *optional*, defaults to "gemlite"):
+                Weight backend to use for the DiT. Set to "nunchaku" to load a
+                DeepCompressor / Nunchaku export bundle instead of running live quantization.
+            nunchaku_export_dir (`str`, *optional*, defaults to None):
+                Path or Hugging Face repo id for the exported Nunchaku transformer bundle.
         """
         self.device = device
         config = multitalk_14B
@@ -116,6 +125,13 @@ class FlashTalkPipeline:
         self.keep_dit_on_gpu = keep_dit_on_gpu
         self.quantize_weights = quantize_weights
         self.weight_bits = weight_bits
+        self.quant_backend = quant_backend
+        self.nunchaku_export_dir = nunchaku_export_dir
+        self.nunchaku_rank = nunchaku_rank
+        if self.quant_backend not in ("gemlite", "nunchaku"):
+            raise ValueError(f"Unsupported quant_backend={self.quant_backend}; expected gemlite or nunchaku.")
+        if self.quant_backend == "nunchaku" and self.weight_bits != 4:
+            raise ValueError("The nunchaku backend currently supports weight_bits=4 only.")
 
         self.text_encoder = T5EncoderModel(
             text_len=config.text_len,
@@ -150,7 +166,24 @@ class FlashTalkPipeline:
             torch_dtype=self.param_dtype,
         )
         self.model.eval().requires_grad_(False)
-        if self.quantize_weights:
+        if self.quantize_weights and self.quant_backend == "nunchaku":
+            if not has_nunchaku_backend():
+                raise ImportError(
+                    "Nunchaku backend requested but the sibling `nunchaku` repo is not importable."
+                )
+            export_root = self.nunchaku_export_dir or checkpoint_dir
+            load_nunchaku_export_into_module(
+                self.model,
+                export_root,
+                precision="auto",
+                rank=self.nunchaku_rank,
+            )
+            logger.info(
+                "Loaded Wan model from Nunchaku export at {} (rank={}).",
+                export_root,
+                self.nunchaku_rank,
+            )
+        elif self.quantize_weights:
             if self.weight_bits == 8:
                 quantize_model_a8w8_int8_gemlite(self.model, device="cuda")
             elif self.weight_bits == 4:
@@ -194,16 +227,19 @@ class FlashTalkPipeline:
     def enable_vram_management(self, num_persistent_param_in_dit=0):
         dtype = next(iter(self.model.parameters())).dtype
         logger.info(f"Enable vram management with dtype: {dtype}")
+        module_map = {
+            GemLiteLinear: AutoWrappedModule,
+            torch.nn.Linear: AutoWrappedLinear,
+            torch.nn.Conv3d: AutoWrappedModule,
+            torch.nn.LayerNorm: AutoWrappedModule,
+            WanLayerNorm: AutoWrappedModule,
+            WanRMSNorm: AutoWrappedModule,
+        }
+        if has_nunchaku_backend():
+            module_map[SVDQW4A4Linear] = AutoWrappedModule
         enable_vram_management(
             self.model,
-            module_map={
-                GemLiteLinear: AutoWrappedModule,
-                torch.nn.Linear: AutoWrappedLinear,
-                torch.nn.Conv3d: AutoWrappedModule,
-                torch.nn.LayerNorm: AutoWrappedModule,
-                WanLayerNorm: AutoWrappedModule,
-                WanRMSNorm: AutoWrappedModule,
-            },
+            module_map=module_map,
             module_config=dict(
                 offload_dtype=dtype,
                 offload_device="cpu",

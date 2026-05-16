@@ -80,6 +80,8 @@ def main() -> None:
 
     num_persistent_param_in_dit = env_int("NUM_PERSISTENT_PARAM_IN_DIT", 15_000_000_000)
     weight_bits = env_int("WEIGHT_BITS", 8)
+    quant_backend = os.environ.get("QUANT_BACKEND", "gemlite")
+    nunchaku_export_dir = os.environ.get("NUNCHAKU_EXPORT_DIR")
     keep_dit_on_gpu = env_bool("KEEP_DIT_ON_GPU", True)
     warmup_runs = env_int("WARMUP_RUNS", 1)
     profile_mode = os.environ.get("PROFILE_MODE", "dit").lower()
@@ -98,6 +100,8 @@ def main() -> None:
         num_persistent_param_in_dit=num_persistent_param_in_dit,
         keep_dit_on_gpu=keep_dit_on_gpu,
         weight_bits=weight_bits,
+        quant_backend=quant_backend,
+        nunchaku_export_dir=nunchaku_export_dir,
         device=f"cuda:{cuda_device_index}",
     )
 

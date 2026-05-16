@@ -13,6 +13,7 @@ from ..layers.attention import SingleStreamMutiAttention
 from ..kernels.rope import fast_rope_apply, sinusoidal_embedding_1d
 from ..kernels.attn import attention
 from ..utils import get_attn_map_with_target
+from ..nunchaku_backend import SVDQW4A4Linear, fused_gelu_mlp, has_nunchaku_backend
 
 
 class WanRMSNorm(nn.Module):
@@ -241,7 +242,17 @@ class WanAttentionBlock(nn.Module):
         )
         x = x + x_a
 
-        y = self.ffn((self.norm2(x).float() * (1 + e[4]) + e[3]).to(dtype))
+        ffn_input = (self.norm2(x).float() * (1 + e[4]) + e[3]).to(dtype)
+        if (
+            has_nunchaku_backend()
+            and isinstance(self.ffn[0], SVDQW4A4Linear)
+            and isinstance(self.ffn[2], SVDQW4A4Linear)
+            and ffn_input.is_cuda
+            and ffn_input.dim() == 3
+        ):
+            y = fused_gelu_mlp(ffn_input, self.ffn[0], self.ffn[2])
+        else:
+            y = self.ffn(ffn_input)
         with amp.autocast("cuda", dtype=torch.float32):
             x = x + y * e[5]
 

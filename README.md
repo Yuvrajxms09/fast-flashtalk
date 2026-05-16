@@ -50,6 +50,8 @@ modelscope download Soul-AILab/SoulX-FlashTalk-14B --local_dir checkpoints/Soul-
 modelscope download TencentGameMate/chinese-wav2vec2-base --local_dir checkpoints/TencentGameMate/chinese-wav2vec2-basechinese-wav2vec2-base
 ```
 
+如果你使用 DeepCompressor / Nunchaku 导出的 DiT bundle，目录里应包含 `transformer_blocks.safetensors` 和 `unquantized_layers.safetensors`，或者一个合并后的单独 `.safetensors` 文件。这个 bundle 可以放在本地磁盘、Modal volume，或者直接指向 Hugging Face repo。
+
 ## 使用说明
 
 首次创建 `FlashTalkPipeline` 时会从磁盘加载多路权重、完成量化与显存调度初始化；首次调用 `generate` 时还可能包含 CUDA 预热、部分算子首次执行等一次性开销，因此**第一次运行整体会明显慢于后续同进程内的推理**，属正常现象。同一进程内再次生成通常会快很多。
@@ -61,10 +63,14 @@ from fast_flashtalk import Audio, FlashTalkPipeline, Image
 
 checkpoint_dir = "path/to/SoulX-FlashTalk-14B"
 wav2vec_dir = "path/to/chinese-wav2vec2-base"
+nunchaku_export_dir = "path/to/nunchaku-export"  # 可换成 Hugging Face repo id
 
 pipeline = FlashTalkPipeline(
     checkpoint_dir=checkpoint_dir,
     wav2vec_dir=wav2vec_dir,
+    quant_backend="nunchaku",
+    weight_bits=4,
+    nunchaku_export_dir=nunchaku_export_dir,
     num_persistent_param_in_dit=15_000_000_000,
 )
 
@@ -90,6 +96,7 @@ video = pipeline.generate(
 |------|------|--------|------|
 | `checkpoint_dir` | `str` | 必填 | FlashTalk 模型权重根目录 |
 | `wav2vec_dir` | `str` | 必填 | Wav2Vec2 模型本地目录 |
+| `nunchaku_export_dir` | `str` | `None` | Nunchaku / DeepCompressor 导出的 transformer bundle 目录或 HF repo |
 | `num_persistent_param_in_dit` | `int` | `10_000_000_000` | 常驻 GPU 的 DiT 参数个数上限，显存紧张时适当调小 |
 
 ### `generate` 主要参数
