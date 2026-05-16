@@ -256,8 +256,12 @@ def load_nunchaku_export_into_module(
         if key.endswith(".wtscale"):
             wtscale_values[key[: -len(".wtscale")]] = float(value.item()) if value.numel() == 1 else float(value.reshape(-1)[0].item())
             continue
+        if key.endswith(".wcscales"):
+            continue
         if key.endswith(".subscale"):
             continue
+        if precision == "nvfp4" and key.endswith(".wscales") and value.dtype != torch.float8_e4m3fn:
+            value = value.to(torch.float8_e4m3fn)
         loadable_state_dict[_remap_export_key(key)] = value
 
     missing_keys, unexpected_keys = module.load_state_dict(loadable_state_dict, strict=False)
