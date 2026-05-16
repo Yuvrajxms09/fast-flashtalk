@@ -171,6 +171,8 @@ def _remap_export_key(key: str) -> str:
         return key[: -len(".lora_down")] + ".proj_down"
     if key.endswith(".lora_up"):
         return key[: -len(".lora_up")] + ".proj_up"
+    if key.endswith(".wscales"):
+        return key[: -len(".wscales")] + ".wcscales"
     if key.endswith(".smooth_orig"):
         return key[: -len(".smooth_orig")] + ".smooth_factor_orig"
     if key.endswith(".smooth"):
