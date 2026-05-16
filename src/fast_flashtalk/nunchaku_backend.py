@@ -213,7 +213,6 @@ def _replace_quantized_linears(
                     rank=rank,
                     precision=precision,
                     torch_dtype=child.weight.dtype,
-                    device=child.weight.device,
                 ),
             )
         else:
