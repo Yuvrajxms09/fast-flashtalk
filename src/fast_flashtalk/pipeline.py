@@ -82,7 +82,7 @@ class FlashTalkPipeline:
         weight_bits=8,
         quant_backend="gemlite",
         nunchaku_export_dir=None,
-        nunchaku_rank=1,
+        nunchaku_rank=None,
     ):
         """FlashTalkPipeline for RTX 4090 GPU.
         Args:
@@ -181,7 +181,7 @@ class FlashTalkPipeline:
             logger.info(
                 "Loaded Wan model from Nunchaku export at {} (rank={}).",
                 export_root,
-                self.nunchaku_rank,
+                self.nunchaku_rank if self.nunchaku_rank is not None else "auto",
             )
         elif self.quantize_weights:
             if self.weight_bits == 8:
