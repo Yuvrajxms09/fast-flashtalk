@@ -171,8 +171,6 @@ def _remap_export_key(key: str) -> str:
         return key[: -len(".lora_down")] + ".proj_down"
     if key.endswith(".lora_up"):
         return key[: -len(".lora_up")] + ".proj_up"
-    if key.endswith(".wscales"):
-        return key[: -len(".wscales")] + ".wcscales"
     if key.endswith(".smooth_orig"):
         return key[: -len(".smooth_orig")] + ".smooth_factor_orig"
     if key.endswith(".smooth"):
@@ -257,8 +255,6 @@ def load_nunchaku_export_into_module(
     for key, value in export_state_dict.items():
         if key.endswith(".wtscale"):
             wtscale_values[key[: -len(".wtscale")]] = float(value.item()) if value.numel() == 1 else float(value.reshape(-1)[0].item())
-            continue
-        if key.endswith(".wcscales"):
             continue
         if key.endswith(".subscale"):
             continue
